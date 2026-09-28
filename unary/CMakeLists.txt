@@ -1,0 +1,8 @@
+add_library(rpc_unary STATIC src/storage.cpp src/connection.cpp src/client.cpp src/server.cpp)
+add_library(lrpc::unary ALIAS rpc_unary)
+target_include_directories(rpc_unary PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/include")
+target_link_libraries(rpc_unary PUBLIC lrpc::wire lrpc::codec net::net)
+lrpc_configure_target(rpc_unary)
+if(LRPC_ENABLE_DIAGNOSTICS)
+    target_compile_definitions(rpc_unary PUBLIC LRPC_ENABLE_DIAGNOSTICS=1)
+endif()

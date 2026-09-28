@@ -1,0 +1,5 @@
+syntax = "proto2";
+package test.messages;
+message Container {
+  message Item { required bytes value = 1; }
+}

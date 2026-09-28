@@ -1,0 +1,17 @@
+syntax = "proto3";
+package demo;
+import "payload.proto";
+message EchoRequest {
+  bytes payload = 1;
+  optional int32 marker = 2;
+  repeated int32 numbers = 3;
+}
+message EchoReply { bytes payload = 1; }
+service Echo {
+  rpc RoundTrip(EchoRequest) returns (EchoReply) {
+    option idempotency_level = IDEMPOTENT;
+  }
+  rpc Required(test.messages.Container.Item) returns (test.messages.Container.Item);
+  rpc delete(EchoRequest) returns (EchoReply);
+}
+service Empty {}

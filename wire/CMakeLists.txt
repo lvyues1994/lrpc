@@ -1,0 +1,11 @@
+add_library(rpc_wire STATIC src/wire.cpp)
+add_library(lrpc::wire ALIAS rpc_wire)
+target_include_directories(rpc_wire PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/include")
+lrpc_configure_target(rpc_wire)
+
+if(LRPC_BUILD_FUZZER)
+    if(NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang" OR NOT LRPC_ENABLE_SANITIZERS)
+        message(FATAL_ERROR "The fuzzer requires Clang and LRPC_ENABLE_SANITIZERS=ON")
+    endif()
+    target_compile_options(rpc_wire PRIVATE -fsanitize=fuzzer-no-link)
+endif()

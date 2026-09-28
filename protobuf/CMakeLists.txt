@@ -1,0 +1,5 @@
+include("${CMAKE_CURRENT_LIST_DIR}/../cmake/ProtobufDependency.cmake")
+add_library(rpc_protobuf INTERFACE)
+add_library(lrpc::protobuf ALIAS rpc_protobuf)
+target_include_directories(rpc_protobuf INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+target_link_libraries(rpc_protobuf INTERFACE lrpc::unary protobuf::libprotobuf)

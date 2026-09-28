@@ -1,0 +1,8 @@
+include("${CMAKE_CURRENT_LIST_DIR}/../cmake/ProtobufDependency.cmake")
+if(NOT TARGET protobuf::libprotoc OR NOT TARGET protobuf::protoc)
+    message(FATAL_ERROR "LRPC_BUILD_CODEGEN requires libprotoc and protoc from the same protobuf provider")
+endif()
+add_executable(protoc-gen-rpc main.cpp)
+target_link_libraries(protoc-gen-rpc PRIVATE protobuf::libprotoc protobuf::libprotobuf)
+lrpc_configure_target(protoc-gen-rpc)
+include("${CMAKE_CURRENT_LIST_DIR}/../cmake/LrpcProtobuf.cmake")

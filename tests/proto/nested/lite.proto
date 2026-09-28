@@ -1,0 +1,5 @@
+syntax = "proto3";
+package demo.lite;
+option optimize_for = LITE_RUNTIME;
+message Message { bytes payload = 1; }
+service Lite { rpc Echo(Message) returns (Message); }

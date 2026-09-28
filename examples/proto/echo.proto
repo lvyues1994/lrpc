@@ -1,0 +1,5 @@
+syntax = "proto3";
+package example.unary;
+message Request { string text = 1; }
+message Reply { string text = 1; }
+service Echo { rpc Echo(Request) returns (Reply); }

@@ -1,0 +1,34 @@
+#include <rpc/wire.hpp>
+
+#include <array>
+#include <cstdlib>
+
+extern "C" int LLVMFuzzerTestOneInput(std::uint8_t const *data, std::size_t size) {
+    namespace w = rpc::wire;
+    w::bytes_view const input{data, size};
+    auto const integer = w::decode_varint(input);
+    if (integer.code == w::error::none) {
+        std::array<std::uint8_t, 10> encoded{};
+        auto const written = w::encode_varint(integer.value, {encoded.data(), encoded.size()});
+        if (written.code != w::error::none || written.written != integer.consumed) std::abort();
+        for (std::size_t i = 0; i < written.written; ++i)
+            if (encoded[i] != data[i]) std::abort();
+    }
+    auto const frame = w::decode_frame(input);
+    if (frame.code == w::error::none) {
+        if (frame.consumed > size || frame.consumed != w::header_size + frame.value.header.length)
+            std::abort();
+        std::array<std::uint8_t, 16> encoded{};
+        auto const written = w::encode_header(frame.value.header, {encoded.data(), encoded.size()});
+        if (written.code != w::error::none) std::abort();
+        for (std::size_t i = 0; i < written.written; ++i)
+            if (encoded[i] != data[i]) std::abort();
+    } else if (frame.consumed != 0) std::abort();
+    w::decode_preface(input);
+    w::decode_settings(input);
+    w::decode_request_head(input, false);
+    w::decode_request_head(input, true);
+    w::decode_end_head(input);
+    w::decode_metadata_entry(input);
+    return 0;
+}

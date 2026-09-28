@@ -1,0 +1,67 @@
+{
+  "version": 3,
+  "cmakeMinimumRequired": {"major": 3, "minor": 21, "patch": 0},
+  "configurePresets": [
+    {
+      "name": "base",
+      "hidden": true,
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/${presetName}",
+      "cacheVariables": {"CMAKE_EXPORT_COMPILE_COMMANDS": true, "LRPC_BUILD_TESTS": true}
+    },
+    {"name": "debug", "inherits": "base", "cacheVariables": {"CMAKE_BUILD_TYPE": "Debug"}},
+    {"name": "release", "inherits": "base", "cacheVariables": {"CMAKE_BUILD_TYPE": "Release"}},
+    {"name": "protobuf", "inherits": "debug", "cacheVariables": {
+      "LRPC_BUILD_PROTOBUF": true, "LRPC_BUILD_CODEGEN": true}},
+    {"name": "protobuf-release", "inherits": "release", "cacheVariables": {
+      "LRPC_BUILD_PROTOBUF": true, "LRPC_BUILD_CODEGEN": true}},
+    {"name": "protobuf-sanitize", "inherits": "sanitize", "cacheVariables": {
+      "LRPC_BUILD_PROTOBUF": true, "LRPC_BUILD_CODEGEN": true}},
+    {
+      "name": "bench", "inherits": "release",
+      "cacheVariables": {"LRPC_BUILD_BENCHMARKS": true, "LRPC_BUILD_TESTS": false,
+        "LRPC_BUILD_EXAMPLES": false}
+    },
+    {"name": "bench-alloc", "inherits": "bench", "cacheVariables": {"LRPC_BENCH_COUNT_ALLOCATIONS": true}},
+    {"name": "bench-queue", "inherits": "bench", "cacheVariables": {"LRPC_ENABLE_DIAGNOSTICS": true}},
+    {"name": "diagnose", "inherits": "bench-alloc", "cacheVariables": {
+      "LRPC_ENABLE_DIAGNOSTICS": true, "CMAKE_CXX_FLAGS": "-g -fno-omit-frame-pointer"}},
+    {"name": "tsan", "inherits": "debug", "cacheVariables": {
+      "CMAKE_CXX_COMPILER": "clang++", "CMAKE_CXX_FLAGS": "-fsanitize=thread -fno-omit-frame-pointer",
+      "CMAKE_EXE_LINKER_FLAGS": "-fsanitize=thread", "LRPC_BUILD_ALLOCATION_FAILURE_TESTS": false}},
+    {
+      "name": "sanitize",
+      "inherits": "debug",
+      "cacheVariables": {"CMAKE_CXX_COMPILER": "clang++", "LRPC_ENABLE_SANITIZERS": true,
+        "CMAKE_CXX_FLAGS": "-fsanitize=address,undefined -fno-omit-frame-pointer"}
+    },
+    {
+      "name": "fuzz",
+      "inherits": "sanitize",
+      "cacheVariables": {"LRPC_BUILD_FUZZER": true, "LRPC_BUILD_NET_SMOKE": false, "LRPC_BUILD_UNARY": false}
+    }
+  ],
+  "buildPresets": [
+    {"name": "debug", "configurePreset": "debug"},
+    {"name": "release", "configurePreset": "release"},
+    {"name": "protobuf", "configurePreset": "protobuf"},
+    {"name": "protobuf-release", "configurePreset": "protobuf-release"},
+    {"name": "protobuf-sanitize", "configurePreset": "protobuf-sanitize"},
+    {"name": "bench", "configurePreset": "bench"},
+    {"name": "bench-alloc", "configurePreset": "bench-alloc"},
+    {"name": "bench-queue", "configurePreset": "bench-queue"},
+    {"name": "diagnose", "configurePreset": "diagnose"},
+    {"name": "tsan", "configurePreset": "tsan"},
+    {"name": "sanitize", "configurePreset": "sanitize"},
+    {"name": "fuzz", "configurePreset": "fuzz"}
+  ],
+  "testPresets": [
+    {"name": "debug", "configurePreset": "debug", "output": {"outputOnFailure": true}},
+    {"name": "release", "configurePreset": "release", "output": {"outputOnFailure": true}},
+    {"name": "protobuf", "configurePreset": "protobuf", "output": {"outputOnFailure": true}},
+    {"name": "protobuf-release", "configurePreset": "protobuf-release", "output": {"outputOnFailure": true}},
+    {"name": "protobuf-sanitize", "configurePreset": "protobuf-sanitize", "output": {"outputOnFailure": true}},
+    {"name": "sanitize", "configurePreset": "sanitize", "output": {"outputOnFailure": true}},
+    {"name": "tsan", "configurePreset": "tsan", "output": {"outputOnFailure": true}}
+  ]
+}
