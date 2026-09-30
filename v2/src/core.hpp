@@ -16,12 +16,14 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <memory>
 #include <new>
 #include <type_traits>
 #include <utility>
 #include <vector>
 
 namespace rpc {
+struct message_compressor;
 namespace v2 {
 namespace detail {
 
@@ -278,11 +280,17 @@ struct shard_state {
     stop_hook *acquire_hook(); // Throws std::bad_alloc.
     void release_hook(stop_hook &hook) noexcept;
 
+    // Created on first use and shared by the shard's connections; its
+    // workspace is not reentrant, which one thread guarantees. Null when the
+    // build lacks the algorithm.
+    message_compressor *compressor(std::uint8_t algorithm) noexcept;
+
     net::io_context &context;
     net::io_context::executor_type executor;
     slab memory;
 
 private:
+    std::array<std::unique_ptr<message_compressor>, 2> compressors_;
     friend struct shard_ticker;
     void arm(std::uint64_t tick) noexcept;
     static net::coroutine_handle<> on_timer(void *ticker) noexcept;

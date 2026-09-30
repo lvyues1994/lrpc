@@ -30,6 +30,11 @@ struct connection_options {
     std::size_t tx_low_watermark = 2U << 20;
     std::uint32_t frames_per_turn = 64;
     std::chrono::milliseconds handshake_timeout{5000};
+    // Stream messages only; both ends must enable wire::message_compression
+    // and share an algorithm in receive.compression (bit 0 zstd, bit 1 LZ4).
+    // A message is sent compressed only when that makes it smaller.
+    std::uint8_t preferred_compression = 0; // 0 none, 1 zstd, 2 LZ4.
+    std::size_t compression_threshold = 1024;
 };
 
 } // namespace v2

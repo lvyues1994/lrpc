@@ -1,5 +1,7 @@
 #include "engine.hpp"
 
+#include <rpc/compression.hpp>
+
 #include <net/buffers.hpp>
 #include <net/run_async.hpp>
 #include <net/task.hpp>
@@ -127,6 +129,8 @@ void connection::start(std::shared_ptr<void> keep) {
     assert(state_ == phase::idle);
     if (options.receive_buffer_bytes < wire::header_size + wire::preface_size)
         throw std::invalid_argument{"receive buffer too small"};
+    if ((options.receive.compression & ~compression_algorithms()) != 0 || options.preferred_compression > 2)
+        throw std::invalid_argument{"compression unavailable in this build"};
     chunks_.resize(4);
     if (!resize_receive(options.receive_buffer_bytes)) throw std::bad_alloc{};
     std::size_t const prefix = server_side_ ? 0 : wire::preface_size;

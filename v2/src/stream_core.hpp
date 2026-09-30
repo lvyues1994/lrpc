@@ -63,6 +63,7 @@ struct stream_core : stream_state {
 
     bool push(inbound_message const &message) noexcept; // False when full.
     bool on_message(wire::frame_view const &frame) noexcept;
+    bool decompress() noexcept;
     bool on_window(wire::frame_view const &frame) noexcept;
     status_code send(wire::bytes_view message) noexcept;
     status_code send_half() noexcept;
@@ -93,7 +94,9 @@ struct stream_core : stream_state {
     bool ended = false;
     status_code result = status_code::ok;
     inbound_message assembly{};
-    std::size_t assembly_total = 0;
+    std::size_t assembly_total = 0;   // Encoded bytes expected.
+    std::size_t assembly_decoded = 0; // Declared decoded size.
+    std::uint8_t assembly_algorithm = 0;
     bool assembling = false;
     std::vector<inbound_message> inbox; // Ring; grows by doubling up to max_buffered.
     std::size_t inbox_head = 0;

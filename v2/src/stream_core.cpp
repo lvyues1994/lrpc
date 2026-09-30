@@ -1,5 +1,7 @@
 #include "stream_core.hpp"
 
+#include <rpc/compression.hpp>
+
 #include <algorithm>
 #include <cstring>
 #include <limits>
@@ -62,6 +64,10 @@ bool stream_core::on_message(wire::frame_view const &frame) noexcept {
             frame.head, {std::numeric_limits<std::uint32_t>::max(), std::numeric_limits<std::uint32_t>::max(),
                          conn->features()}).value; // Validated with the frame.
         if (descriptor.encoded_size > max_inbound || descriptor.decoded_size > max_inbound) return false;
+        if (descriptor.algorithm != 0 &&
+            (descriptor.algorithm > 2 ||
+             (conn->options.receive.compression & conn->peer().compression & (1U << (descriptor.algorithm - 1U))) == 0))
+            return false;
         auto const cost = message_cost(std::max(descriptor.encoded_size, descriptor.decoded_size));
         if (flow_controlled() && cost > receive_credit) return false;
         if (receives_one() && received != 0) {
@@ -78,6 +84,8 @@ bool stream_core::on_message(wire::frame_view const &frame) noexcept {
         if (flow_controlled()) receive_credit -= cost;
         assembly = {block, block != nullptr ? slab::block_size(descriptor.encoded_size) : 0, 0, cost, true};
         assembly_total = descriptor.encoded_size;
+        assembly_decoded = descriptor.decoded_size;
+        assembly_algorithm = descriptor.algorithm;
         assembling = true;
     } else if (!assembling) {
         return false;
@@ -88,6 +96,7 @@ bool stream_core::on_message(wire::frame_view const &frame) noexcept {
     if ((flags & wire::more) != 0) return assembly.size < assembly_total;
     if (assembly.size != assembly_total) return false;
     assembling = false;
+    if (assembly_algorithm != 0 && !decompress()) return false;
     if (!push(assembly)) {
         shard.memory.deallocate(assembly.block, assembly.capacity);
         assembly = {};
@@ -100,6 +109,26 @@ bool stream_core::on_message(wire::frame_view const &frame) noexcept {
     return true;
 }
 
+// Replaces the assembled encoding with exactly the declared decoded bytes;
+// the declared size was bounded before any memory was taken.
+bool stream_core::decompress() noexcept {
+    auto *const codec = shard.compressor(assembly_algorithm);
+    if (codec == nullptr) return false;
+    std::uint8_t *decoded = nullptr;
+    try {
+        if (assembly_decoded != 0) decoded = shard.memory.allocate(assembly_decoded);
+    } catch (std::bad_alloc const &) {
+        return false;
+    }
+    auto const result =
+        codec->decompress_exact({assembly.block, assembly.size}, {decoded, assembly_decoded});
+    shard.memory.deallocate(assembly.block, assembly.capacity);
+    assembly.block = decoded;
+    assembly.capacity = decoded != nullptr ? slab::block_size(assembly_decoded) : 0;
+    assembly.size = assembly_decoded;
+    return result.code == wire::error::none && result.written == assembly_decoded;
+}
+
 bool stream_core::on_window(wire::frame_view const &frame) noexcept {
     if (!flow_controlled() || frame.header.aux > peer_window - send_credit) return false;
     send_credit += frame.header.aux;
@@ -107,12 +136,50 @@ bool stream_core::on_window(wire::frame_view const &frame) noexcept {
     return true;
 }
 
+namespace {
+
+// A compressed copy when compression is negotiated and pays off.
+struct compressed_copy {
+    slab &memory;
+    std::uint8_t *block = nullptr;
+    std::size_t capacity = 0;
+    wire::bytes_view bytes{};
+    std::uint8_t algorithm = 0;
+    ~compressed_copy() { memory.deallocate(block, capacity); }
+};
+
+void compress(connection const &link, shard_state &shard, wire::bytes_view const message, compressed_copy &out) noexcept {
+    auto const algorithm = link.options.preferred_compression;
+    if (algorithm == 0 || message.size < link.options.compression_threshold ||
+        (link.features() & wire::message_compression) == 0 || (link.peer().compression & (1U << (algorithm - 1U))) == 0)
+        return;
+    auto *const codec = shard.compressor(algorithm);
+    auto const bound = codec != nullptr ? codec->bound(message.size) : 0;
+    if (bound == 0) return;
+    try {
+        out.block = shard.memory.allocate(bound);
+        out.capacity = slab::block_size(bound);
+    } catch (std::bad_alloc const &) {
+        return; // Send it uncompressed.
+    }
+    auto const result = codec->compress(message, {out.block, bound});
+    if (result.code != wire::error::none || result.written >= message.size) return;
+    out.bytes = {out.block, result.written};
+    out.algorithm = algorithm;
+}
+
+} // namespace
+
 status_code stream_core::send(wire::bytes_view const message) noexcept {
     auto &link = *conn;
+    compressed_copy packed{shard.memory};
+    compress(link, shard, message, packed);
+    auto const payload = packed.algorithm != 0 ? packed.bytes : message;
     std::array<std::uint8_t, wire::message_descriptor_size> descriptor{};
     auto const size = static_cast<std::uint32_t>(message.size);
-    if (wire::encode_message_descriptor({size, size, 0}, {descriptor.data(), descriptor.size()}, link.outgoing()).code !=
-        wire::error::none)
+    if (wire::encode_message_descriptor({static_cast<std::uint32_t>(payload.size), size, packed.algorithm},
+                                        {descriptor.data(), descriptor.size()}, link.outgoing())
+            .code != wire::error::none)
         return status_code::resource_exhausted;
     if (flow_controlled()) send_credit -= message_cost(size);
     std::size_t const max_frame = link.peer().max_frame_size;
@@ -121,24 +188,25 @@ status_code stream_core::send(wire::bytes_view const message) noexcept {
     try {
         do {
             std::size_t const head = first ? descriptor.size() : 0;
-            auto const count = std::min(message.size - offset, max_frame - head);
+            auto const count = std::min(payload.size - offset, max_frame - head);
             auto *const frame = link.reserve(wire::header_size + head + count);
             wire::frame_header header{};
             header.length = static_cast<std::uint32_t>(head + count);
             header.stream_id = id;
             header.type = wire::frame_type::message;
-            header.flags = offset + count < message.size ? wire::more : std::uint8_t{0};
+            header.flags = static_cast<std::uint8_t>((offset + count < payload.size ? wire::more : 0) |
+                                                     (first && packed.algorithm != 0 ? wire::compressed : 0));
             header.head_length = static_cast<std::uint16_t>(head);
             if (wire::encode_header(header, {frame, wire::header_size}, link.outgoing()).code != wire::error::none) {
                 link.close();
                 return status_code::internal;
             }
             if (head != 0) std::memcpy(frame + wire::header_size, descriptor.data(), head);
-            if (count != 0) std::memcpy(frame + wire::header_size + head, message.data + offset, count);
+            if (count != 0) std::memcpy(frame + wire::header_size + head, payload.data + offset, count);
             link.commit(wire::header_size + head + count);
             offset += count;
             first = false;
-        } while (offset < message.size);
+        } while (offset < payload.size);
     } catch (std::bad_alloc const &) {
         link.close(); // A message cut short cannot be resumed on the wire.
         return status_code::unavailable;

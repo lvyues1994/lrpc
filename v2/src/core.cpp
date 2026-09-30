@@ -1,5 +1,7 @@
 #include "core.hpp"
 
+#include <rpc/compression.hpp>
+
 #include <algorithm>
 
 namespace rpc {
@@ -355,6 +357,19 @@ void shard_state::release_hook(stop_hook &hook) noexcept {
     hook.target = nullptr;
     hook.next = free_hooks_;
     free_hooks_ = &hook;
+}
+
+message_compressor *shard_state::compressor(std::uint8_t const algorithm) noexcept {
+    if (algorithm == 0 || algorithm > compressors_.size()) return nullptr;
+    auto &slot = compressors_[algorithm - 1U];
+    if (!slot) {
+        try {
+            slot = make_message_compressor(static_cast<compression_algorithm>(algorithm));
+        } catch (std::bad_alloc const &) {
+            return nullptr;
+        }
+    }
+    return slot.get();
 }
 
 } // namespace detail
