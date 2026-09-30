@@ -101,8 +101,10 @@ CO2_AWAIT_SET(result, users.GetUser(request, reply));
 
 错误的参数类型在编译时拒绝。bound_method 只能由 `rpc::bind` 创建，不能把任意擦除 handle
 重新标注为其它消息类型。stub 借用 client，调用完成前请求、响应及 metadata 均须保活。
-多个方法各持有自己的绑定；[完整示例](../examples/json_users.cpp) 注册并调用 GetUser、RenameUser，
-共享结构体和 stub 见 [服务契约](../examples/json_users.hpp)。
+多方法服务可使用 `service_contract` 一次批量绑定，server 与 stub 共用类型/名字定义。
+[完整示例](../examples/json_users.cpp) 注册并调用 GetUser、RenameUser，
+共享结构体和 stub 见 [users.hpp](../examples/users.hpp)。初始化选 JSON/protobuf、普通结构体的显式
+protobuf 映射及原子注册见 [共享服务契约](service-contract.md)。
 
 单分片 client/channel 也可使用 `rpc::call(client, get_user, request, reply, options)`。
 带幂等性声明的方法会冷绑定并消费该声明；默认 unknown 保留字符串入口。

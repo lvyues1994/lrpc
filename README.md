@@ -85,6 +85,10 @@ ctest --preset protobuf
 JSON 使用现有 lrpc body 与 metadata，双方法示例见 [json_users.cpp](examples/json_users.cpp)，
 构建、字段策略、容量限制和性能基线见 [JSON 用法](docs/json.md)。
 
+多方法服务可在创建共享契约时选择 JSON 或显式映射的 protobuf，server 注册和 client stub 使用同一契约，
+业务保留普通结构体参数及 `users.GetUser(request, reply)` 调用。示例同时启用两模块和 codegen 后，
+`json_users protobuf` 使用 protobuf；契约、映射、格式匹配要求见 [共享服务契约](docs/service-contract.md)。
+
 ## 调用与资源约定
 
 - 原始字节和自定义类型接口链接 `lrpc::unary`；protobuf 接口链接 `lrpc::protobuf` 或生成的协议 target。
@@ -120,14 +124,17 @@ JSON 使用现有 lrpc body 与 metadata，双方法示例见 [json_users.cpp](e
 | --- | --- |
 | `debug` / `release` | 原始字节、自定义 codec 和 metadata；Release 同样保留测试检查 |
 | `protobuf` / `protobuf-release` | 增加 protobuf、生成代码及对应示例测试 |
+| `json` / `json-release` / `json-sanitize` | 普通结构体 JSON、类型化服务及字段/资源校验 |
 | `sanitize` / `protobuf-sanitize` | Clang AddressSanitizer + UBSan，包含本地 net 源码 |
 | `tsan` | ThreadSanitizer；不构建与其全局分配器冲突的故障注入程序 |
 | `fuzz` | Clang libFuzzer 协议测试，无需 net |
 
 切换构建目录时需重新传入依赖路径。测试覆盖协议边界、部分读写、粘包、缓冲寿命、预算回收、并发取消、超时、过载、
 分配失败及生成器负例；TCP 与取消压力按 epoll/poll/select/io_uring 运行，不可用后端明确跳过。
-本阶段 Debug 30 项、protobuf Release 与 ASan/UBSan/LSan 各 40 项、TSan 28 项通过；覆盖四个网络后端且本机无跳过。
+运行时升级阶段 Debug 30 项、protobuf Release 与 ASan/UBSan/LSan 各 40 项、TSan 28 项通过；覆盖四个网络后端且本机无跳过。
 新增检查包含线程启动回滚、有限排队/重试、跨分片调用、四种生成接口、分片消息、压缩、外线程取消及晚释放 buffer。
+共享服务契约阶段 JSON-only Debug 35 项、JSON+protobuf Release 与 ASan/UBSan/LSan 各 48 项通过，无跳过；
+新增覆盖两种编码共用业务结构体、批量注册回滚、契约生命周期、原生 protobuf 字节比较与映射编译检查。
 发行版 protobuf 二进制本身未插桩；TSan 排除全局 new 故障注入及 pthread_create 拦截测试。
 
 运行协议模糊测试：

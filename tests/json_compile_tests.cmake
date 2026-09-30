@@ -27,7 +27,20 @@ set(unmapped [=[
 struct Unmapped { int value; };
 void invoke() { rpc::json_codec_policy::operations<Unmapped>(); }
 ]=])
-foreach(name positive wrong_request wrong_response wrong_handler forged_handle unmapped)
+set(wrong_service_call [=[
+void invoke(rpc::client &c) {
+    auto s = rpc::bind_service(c, example::users_contract(rpc::json_codec_policy{}));
+    example::RenameUserRequest r; example::GetUserReply v; s.call<0>(r, v);
+}
+]=])
+set(wrong_service_handler [=[
+struct S {
+    net::task<rpc::status_code> GetUser(rpc::server_context &, example::RenameUserRequest const &, example::GetUserReply &);
+    net::task<rpc::status_code> RenameUser(rpc::server_context &, example::RenameUserRequest const &, example::RenameUserReply &);
+};
+void invoke(rpc::server_builder &b, S &s) { example::add_users_service(b, example::users_contract(rpc::json_codec_policy{}), s); }
+]=])
+foreach(name positive wrong_request wrong_response wrong_handler forged_handle unmapped wrong_service_call wrong_service_handler)
     file(WRITE "${WORK}/${name}.cpp" "${prelude}${${name}}")
     execute_process(COMMAND "${COMPILER}" -std=c++14 -fsyntax-only ${flags} "${WORK}/${name}.cpp"
         RESULT_VARIABLE result OUTPUT_VARIABLE output ERROR_VARIABLE error)
@@ -39,4 +52,4 @@ foreach(name positive wrong_request wrong_response wrong_handler forged_handle u
         message(FATAL_ERROR "Invalid typed contract compiled: ${name}")
     endif()
 endforeach()
-message(STATUS "Typed stub positive and five negative compile checks passed")
+message(STATUS "Typed method/service stub positive and seven negative compile checks passed")

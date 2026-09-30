@@ -4,6 +4,9 @@ P2 提供可选的 `lrpc::protobuf`、`protoc-gen-rpc` 及双向 metadata API，
 普通原始字节构建不依赖 protobuf；`lrpc::codec` 和 `<rpc/typed.hpp>` 也可用于自定义消息。
 后续运行时升级已引入固定调用槽、共享精确截止、冷方法绑定、server_builder、状态说明和四种 RPC 接口；完整性能验收仍待完成。
 
+普通 C++ 结构体也可通过显式 `protobuf_mapping<T>` 使用生成消息，保留同一个命名 stub 和业务 handler，
+初始化时选择 JSON/protobuf；映射、服务契约和格式匹配要求见 [共享服务契约](service-contract.md)。
+
 ## 构建和生成
 
 需要同一供应来源的 protobuf 头文件、libprotobuf、libprotoc 和 protoc；已验证版本为 Ubuntu 的 **3.21.12-8.2ubuntu0.3**。

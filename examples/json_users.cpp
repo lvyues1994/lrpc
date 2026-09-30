@@ -1,4 +1,7 @@
 #include "json_users.hpp"
+#ifdef LRPC_USERS_PROTOBUF
+#include "protobuf_users.hpp"
+#endif
 #include <net/run_async.hpp>
 #include <array>
 #include <iostream>
@@ -55,17 +58,25 @@ auto run(rpc::client *client, net::ip::tcp::endpoint endpoint, example::UserStub
 }
 CO2_END
 }
-int main() {
+int main(int argc, char **argv) {
     try {
         net::io_context context{net::default_backend, net::single_thread_hint}; UserService service;
+        auto contract = example::users_contract(rpc::json_codec_policy{});
+#ifdef LRPC_USERS_PROTOBUF
+        if (argc == 2 && std::string{argv[1]} == "protobuf")
+            contract = example::users_contract(rpc::mapped_protobuf_codec_policy{});
+        else if (argc != 1) throw std::invalid_argument{"usage: json_users [protobuf]"};
+#else
+        (void)argv;
+        if (argc != 1) throw std::invalid_argument{"usage: json_users"};
+#endif
         rpc::server_builder builder{context};
-        builder.add(example::get_user_method(), service, &UserService::GetUser, {1024, 128})
-               .add(example::rename_user_method(), service, &UserService::RenameUser, {128, 2});
+        example::add_users_service(builder, contract, service);
         auto server = builder.build(); auto client = rpc::make_client(context);
         auto endpoint = server->listen({net::ip::address_v4::loopback(), 0}); std::exception_ptr failure;
         auto close = [&] { client->close(); server->close(); };
         net::run_async(context.get_executor(), close, [&](std::exception_ptr error) { failure = error; close(); })
-            ([&] { return run(client.get(), endpoint, example::UserStub{*client}); });
+            ([&] { return run(client.get(), endpoint, example::UserStub{*client, contract}); });
         context.run(); if (failure) std::rethrow_exception(failure);
     } catch (std::exception const &error) { std::cerr << error.what() << '\n'; return 1; }
 }

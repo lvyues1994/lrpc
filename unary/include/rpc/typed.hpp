@@ -12,7 +12,7 @@ namespace rpc {
 enum class idempotency { unknown, no_side_effects, idempotent };
 
 struct method_descriptor {
-    char const *name = nullptr; // Fully qualified wire name; static lifetime.
+    char const *name = nullptr; // Fully qualified wire name; borrowed during synchronous bind.
     method_kind kind = method_kind::unary;
     idempotency semantics = idempotency::unknown; // Descriptive; never enables retries.
     codec_ops const *request_codec = nullptr;
@@ -109,7 +109,11 @@ inline status_code decode_input(codec_ops const &ops, wire::bytes_view bytes, vo
 template <class Request, class Response, class Service, class Result, class Policy = default_codec_policy>
 struct typed_method_handler final : method_handler {
     using function_type = net::task<Result> (Service::*)(server_context &, Request const &, Response &);
-    typed_method_handler(Service &service, function_type function, std::size_t count) : service(service), function(function) {
+    typed_method_handler(Service &service, function_type function, std::size_t count,
+        codec_ops const &request_ops = Policy::template operations<Request>(),
+        codec_ops const &response_ops = Policy::template operations<Response>())
+        : service(service), function(function), request_ops(request_ops), response_ops(response_ops) {
+        if (!function) throw std::invalid_argument{"null RPC handler"};
         if (count > 65536 || (count && !message_storage<Request, Response>::reusable)) throw std::invalid_argument{"invalid message cache"};
         cache.reserve(count); free.reserve(count);
         for (std::size_t i = 0; i < count; ++i) { cache.push_back(std::make_unique<message_storage<Request, Response>>()); free.push_back(i); }
@@ -117,6 +121,8 @@ struct typed_method_handler final : method_handler {
     net::task<status_code> invoke(server_context &context, wire::bytes_view bytes, response_writer &writer) override;
     Service &service;
     function_type function;
+    codec_ops const &request_ops;
+    codec_ops const &response_ops;
     std::vector<std::unique_ptr<message_storage<Request, Response>>> cache;
     std::vector<std::size_t> free;
     mutable std::mutex cache_mutex;
@@ -145,14 +151,14 @@ auto invoke_typed(typed_method_handler<Request, Response, Service, Result, Polic
                   wire::bytes_view bytes, response_writer *writer)
     CO2_BEG(net::task<status_code>, (handler, context, bytes, writer),
             message_storage<Request, Response> messages; Result result; status_code code; wire::encode_result encoded;) {
-    code = decode_input(Policy::template operations<Request>(), bytes, &messages.request());
+    code = decode_input(handler->request_ops, bytes, &messages.request());
     if (code != status_code::ok) CO2_RETURN(code);
     if (context->stop_token.stop_requested()) CO2_RETURN(status_code::cancelled);
     if (clock::now() >= context->deadline) CO2_RETURN(status_code::deadline_exceeded);
     CO2_AWAIT_SET(result, (handler->service.*handler->function)(*context, messages.request(), messages.response()));
     code = normalize_status(*context, result);
     if (code != status_code::ok) CO2_RETURN(code);
-    try { encoded = encode_into(Policy::template operations<Response>(), &messages.response(), writer->buffer()); }
+    try { encoded = encode_into(handler->response_ops, &messages.response(), writer->buffer()); }
     catch (std::bad_alloc const &) { CO2_RETURN(status_code::resource_exhausted); }
     if (encoded.code != wire::error::none || encoded.written > writer->buffer().size) {
         writer->commit(writer->buffer().size + 1);
@@ -175,13 +181,13 @@ auto invoke_cached(typed_method_handler<Request, Response, Service, Result, Poli
             message_storage<Request, Response> *messages = nullptr; Result result; status_code code; wire::encode_result encoded;) {
     if (!handler->acquire(lease.index)) CO2_RETURN(status_code::resource_exhausted);
     lease.handler = handler; messages = handler->cache[lease.index].get();
-    code = decode_input(Policy::template operations<Request>(), bytes, &messages->request());
+    code = decode_input(handler->request_ops, bytes, &messages->request());
     if (code != status_code::ok) CO2_RETURN(code);
     if (context->stop_token.stop_requested()) CO2_RETURN(status_code::cancelled);
     if (clock::now() >= context->deadline) CO2_RETURN(status_code::deadline_exceeded);
     CO2_AWAIT_SET(result, (handler->service.*handler->function)(*context, messages->request(), messages->response()));
     code = normalize_status(*context, result); if (code != status_code::ok) CO2_RETURN(code);
-    try { encoded = encode_into(Policy::template operations<Response>(), &messages->response(), writer->buffer()); }
+    try { encoded = encode_into(handler->response_ops, &messages->response(), writer->buffer()); }
     catch (std::bad_alloc const &) { CO2_RETURN(status_code::resource_exhausted); }
     if (encoded.code != wire::error::none || encoded.written > writer->buffer().size) {
         writer->commit(writer->buffer().size + 1); CO2_RETURN(status_code::internal);

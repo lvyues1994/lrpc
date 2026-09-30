@@ -1,0 +1,15 @@
+syntax = "proto3";
+package example.wire;
+
+message GetUserRequest { uint64 id = 1; }
+message User {
+  uint64 id = 1;
+  string name = 2;
+  repeated string roles = 3;
+}
+message GetUserReply { User user = 1; }
+message RenameUserRequest {
+  uint64 id = 1;
+  string name = 2;
+}
+message RenameUserReply { bool updated = 1; }

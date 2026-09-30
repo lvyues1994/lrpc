@@ -53,6 +53,11 @@ if(LRPC_BUILD_TESTS)
         lrpc_configure_target(typed_tests)
         add_test(NAME typed COMMAND typed_tests)
         set_tests_properties(typed PROPERTIES TIMEOUT 20)
+        add_executable(service_tests service_tests.cpp)
+        target_link_libraries(service_tests PRIVATE lrpc::unary)
+        lrpc_configure_target(service_tests)
+        add_test(NAME service COMMAND service_tests)
+        set_tests_properties(service PROPERTIES TIMEOUT 20)
         add_executable(unary_tests unary_tests.cpp)
         target_link_libraries(unary_tests PRIVATE lrpc::unary)
         lrpc_configure_target(unary_tests)
@@ -125,6 +130,24 @@ if(LRPC_BUILD_TESTS)
         add_test(NAME codegen COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/codegen_tests.py"
             "$<TARGET_FILE:protobuf::protoc>" "$<TARGET_FILE:protoc-gen-rpc>" "${CMAKE_CURRENT_SOURCE_DIR}/proto")
         set_tests_properties(codegen PROPERTIES TIMEOUT 30)
+        if(LRPC_BUILD_JSON)
+            lrpc_generate_cpp(mapped_users_protocol IMPORT_DIR "${PROJECT_SOURCE_DIR}/examples/proto" PROTOS users.proto)
+            add_executable(service_rpc_tests service_rpc_tests.cpp)
+            target_link_libraries(service_rpc_tests PRIVATE mapped_users_protocol lrpc::json lrpc::runtime)
+            lrpc_configure_target(service_rpc_tests)
+            add_test(NAME service_rpc COMMAND service_rpc_tests)
+            set_tests_properties(service_rpc PROPERTIES TIMEOUT 20)
+            if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+                file(GENERATE OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/mapping-includes.txt"
+                    CONTENT "$<JOIN:$<TARGET_PROPERTY:service_rpc_tests,INCLUDE_DIRECTORIES>,\n>")
+                add_test(NAME protobuf_mapping_compile COMMAND "${CMAKE_COMMAND}"
+                    "-DCOMPILER=${CMAKE_CXX_COMPILER}" "-DSOURCE=${PROJECT_SOURCE_DIR}"
+                    "-DINCLUDES=${CMAKE_CURRENT_BINARY_DIR}/mapping-includes.txt"
+                    "-DWORK=${CMAKE_CURRENT_BINARY_DIR}/mapping-compile"
+                    -P "${CMAKE_CURRENT_SOURCE_DIR}/protobuf_mapping_compile_tests.cmake")
+                set_tests_properties(protobuf_mapping_compile PROPERTIES TIMEOUT 30)
+            endif()
+        endif()
     endif()
 
     if(LRPC_BUILD_NET_SMOKE)

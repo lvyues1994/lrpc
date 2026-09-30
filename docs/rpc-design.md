@@ -1115,6 +1115,10 @@ net 未提供可分离租约，因此没有实现内核到业务的端到端零�
 net::task、原有帧、状态与 metadata。非侵入 traits/字段宏映射普通结构体；json_method 选择独立编码策略，
 server_builder 的类型化 add 校验 handler 签名，typed bound_method 支持手写的命名服务 stub。
 GetUser/RenameUser 示例已提供，暂未引入 JSON 代码生成器、HTTP 或 JSON-RPC 2.0 入口。
+`service_contract` 在初始化时选择 codec 表，server 批量注册与命名 stub 共用强类型方法定义，
+批量失败不保留部分新注册。普通结构体通过显式 `protobuf_mapping` 转换为 `.proto` 生成消息，
+同一业务接口可选 JSON/protobuf；同名方法双方仍须配置相同格式，未增加在线 codec 协商。
+生命周期、转换上界及多方法例子见 [共享服务契约](service-contract.md)。
 
 有界编码回调避免为测量大小重复序列化；channel 在既有 replay budget 内保存单次编码快照，重试复用。
 SAX 解码直接写入拥有型字段，执行完整输入、重复键、UTF-8、数值及深度/数量/逻辑值/临时栈限制；
