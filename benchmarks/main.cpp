@@ -68,12 +68,12 @@ options parse(int argc, char **argv) {
         else if (key == "--port" && number <= 65535) config.port = static_cast<std::uint16_t>(number);
         else throw std::invalid_argument{"unknown option: " + key};
     }
-    if ((config.transport != "net" && config.transport != "rpc") ||
+    if ((config.transport != "net" && config.transport != "rpc" && config.transport != "v2") ||
         config.arena_cache > 65536 || (config.arena_cache && config.codec != "protobuf") ||
         (config.rpc_entry != "client" && config.rpc_entry != "channel" && config.rpc_entry != "runtime") ||
         (config.rpc_entry != "client" && (config.transport != "rpc" || config.role != "both" || config.recycle_frames)) ||
         (config.codec != "bytes" && config.codec != "protobuf") ||
-        (config.transport == "net" && config.codec != "bytes") || (config.bytes != 64 && config.bytes != 4096) ||
+        (config.transport != "rpc" && config.codec != "bytes") || (config.bytes != 64 && config.bytes != 4096) ||
         config.inflight == 0 || config.inflight > 1024 || config.iterations == 0 || config.iterations > 10000000 ||
         config.warmup == 0 || config.warmup > 1000000 || config.burst == 0 || config.burst > 1024 ||
         config.receive_buffer_bytes < 8208 || config.receive_buffer_bytes > 16U * 1024U * 1024U + 16 ||
@@ -172,7 +172,7 @@ void report(options const &config, measurements const &result) {
         << "{\"transport\":\"" << config.transport << "\",\"codec\":\"" << config.codec
         << "\",\"mode\":\"" << (config.rate ? "open" : "closed")
         << "\",\"backend\":\"" << net::to_string(config.backend) << "\",\"build\":\"" << LRPC_BENCH_BUILD_TYPE
-        << "\",\"raw_path\":\"" << (config.transport == "rpc" ? "none" : config.inflight == 1 && config.rate == 0 ? "direct" : "fifo")
+        << "\",\"raw_path\":\"" << (config.transport != "net" ? "none" : config.inflight == 1 && config.rate == 0 ? "direct" : "fifo")
         << "\",\"topology\":\"" << (config.rpc_entry == "runtime" ? "fixed_shard_loopback" : config.role == "client" ? "separate_process_loopback" : "same_thread_loopback")
         << "\",\"cpu_scope\":\"" << (config.role == "client" ? "client_process" : "both_endpoints")
         << "\",\"rpc_entry\":\"" << config.rpc_entry << "\",\"connections\":" << (config.rpc_entry == "runtime" ? 2 : 1)
@@ -213,7 +213,7 @@ void report(options const &config, measurements const &result) {
 #endif
     std::cout << ",\"rpc_queue_latency\":";
 #ifdef LRPC_ENABLE_DIAGNOSTICS
-    if (config.transport == "net") std::cout << "null";
+    if (config.transport != "rpc") std::cout << "null";
     else {
         std::cout << "{\"scope\":\"" << (config.role == "client" ? "client_process" : "both_endpoints")
             << "\",\"population\":\"submitted_frames_only\",\"unit\":\"ns\",\"bucket_upper_bound\":\"2^index\",\"boundary\":\"enqueue_to_first_write_submission\",";

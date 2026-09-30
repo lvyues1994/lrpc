@@ -69,7 +69,7 @@ CPU 亲和不等于独占 CPU，请同时查看环境文件中的 SMT、频率�
   不能用未通过轮次宣称满足对应负载下的低 p99。
   插桩构建的 `diagnostic_only=true`，不计入可用于延迟验收的轮次。
 
-常用单次选项：`--transport net|rpc`、`--codec bytes|protobuf`、`--bytes 64|4096`、`--inflight N`、`--backend epoll|poll|select|io_uring`、
+常用单次选项：`--transport net|rpc|v2`（v2 只支持 bytes codec 和 client 入口）、`--codec bytes|protobuf`、`--bytes 64|4096`、`--inflight N`、`--backend epoll|poll|select|io_uring`、
 `--rate R`（0 为闭环）、`--burst N`、`--rpc-streams N`（服务端 stream 上限）、`--deadline-us N`、
 `--frame-allocator system|recycling`、`--receive-buffer-bytes N`、`--samples path.csv`。raw 不实现逐调用截止。单次运行阶段含预热有 30 秒看门狗，
 随后关闭并用 `context.run()` 排空，该清理阶段没有内部截止；suite 另对客户端进程设 60 秒超时。

@@ -1,5 +1,7 @@
 #include "bench.hpp"
 #include <rpc/runtime.hpp>
+#include <rpc/v2/client.hpp>
+#include <rpc/v2/server.hpp>
 
 #include <net/run_async.hpp>
 #include <net/stream.hpp>
@@ -131,6 +133,82 @@ struct rpc_channel final : channel {
     rpc::method<lrpc_bench::Payload, lrpc_bench::Payload> operation{"bench/ProtoEcho"};
 #endif
 };
+
+auto v2_echo(rpc::wire::bytes_view request, rpc::v2::response_writer &response)
+    CO2_BEG(net::task<rpc::v2::status_code>, (request, response)) {
+    CO2_RETURN(response.assign(request) ? rpc::v2::status_code::ok : rpc::v2::status_code::internal);
+}
+CO2_END
+
+struct v2_echo_handler final : rpc::v2::method_handler {
+    net::task<rpc::v2::status_code> invoke(rpc::v2::server_context &, rpc::wire::bytes_view request,
+                                           rpc::v2::response_writer &response) override {
+        return v2_echo(request, response);
+    }
+};
+
+struct v2_channel final : channel {
+    v2_channel(net::io_context &ctx, options const &config) : shard(ctx) {
+        rpc::v2::server_options so{};
+        so.connection.receive.max_frame_size = 8192;
+        so.connection.receive.max_message_size = 8192;
+        so.connection.receive.max_concurrent_streams = static_cast<std::uint32_t>(config.rpc_streams);
+        so.connection.receive_buffer_bytes = config.receive_buffer_bytes;
+        so.max_connections = 1;
+        so.max_active_calls = config.rpc_streams;
+        rpc::v2::client_options co{};
+        co.connection = so.connection;
+        co.connection.receive.max_concurrent_streams = static_cast<std::uint32_t>(config.inflight);
+        if (config.role != "client") server.reset(new rpc::v2::server(shard, {{"bench/Echo", &handler, config.bytes}}, so));
+        if (config.role != "server") {
+            client.reset(new rpc::v2::client(shard, co));
+            method = client->bind("bench/Echo");
+        }
+        endpoint = {net::ip::address_v4::loopback(), config.port};
+        measured = std::chrono::microseconds{static_cast<std::int64_t>(config.deadline_us)};
+        if (config.deadline_us != 0) {
+            spec.timeout = std::max(measured, std::chrono::microseconds{1000000});
+            active_spec = &spec;
+        }
+    }
+    net::task<rpc::status_code> connect() override;
+    net::task<rpc::call_result> call(slot &storage) override;
+    void begin_measurement() noexcept override {
+        if (active_spec != nullptr) spec.timeout = measured;
+    }
+    void close() noexcept override {
+        if (client) client->close();
+        if (server) server->close();
+    }
+    rpc::v2::shard shard;
+    v2_echo_handler handler{};
+    std::unique_ptr<rpc::v2::server> server{};
+    std::unique_ptr<rpc::v2::client> client{};
+    rpc::v2::method_ref method{};
+    net::ip::tcp::endpoint endpoint{};
+    rpc::v2::call_spec spec{};
+    rpc::v2::call_spec const *active_spec = nullptr;
+    std::chrono::microseconds measured{};
+};
+
+auto v2_connect(v2_channel &self)
+    CO2_BEG(net::task<rpc::status_code>, (self), rpc::v2::status_code connected;) {
+    if (self.server) self.endpoint = self.server->listen({net::ip::address_v4::loopback(), 0});
+    CO2_AWAIT_SET(connected, self.client->connect(self.endpoint));
+    CO2_RETURN(static_cast<rpc::status_code>(connected));
+}
+CO2_END
+
+auto v2_call(v2_channel &self, slot &storage)
+    CO2_BEG(net::task<rpc::call_result>, (self, storage), rpc::v2::call_result result;) {
+    CO2_AWAIT_SET(result, self.client->call(self.method, {storage.request.data(), storage.request.size()},
+                                            {storage.reply.data(), storage.reply.size()}, self.active_spec));
+    CO2_RETURN((rpc::call_result{static_cast<rpc::status_code>(result.code), result.size}));
+}
+CO2_END
+
+net::task<rpc::status_code> v2_channel::connect() { return v2_connect(*this); }
+net::task<rpc::call_result> v2_channel::call(slot &storage) { return v2_call(*this, storage); }
 
 // Fixed-capacity FIFO over driver-owned slots; no per-enqueue allocation.
 class slot_queue {
@@ -307,6 +385,7 @@ CO2_END
 
 std::unique_ptr<channel> make_channel(net::io_context &context, options const &config) {
     if (config.transport == "rpc") return std::make_unique<rpc_channel>(context, config);
+    if (config.transport == "v2") return std::make_unique<v2_channel>(context, config);
     return std::make_unique<raw_channel>(context, config);
 }
 
@@ -317,15 +396,25 @@ void serve(options const &config) {
     net::signal_set signals{context, SIGINT, SIGTERM};
     net::stop_source shutdown;
     std::unique_ptr<rpc_channel> rpc_server;
+    std::unique_ptr<v2_channel> v2_server;
     std::unique_ptr<raw_channel> raw_server;
     std::exception_ptr failure;
     bool stopped = false;
-    auto close = [&] { shutdown.request_stop(); if (rpc_server) rpc_server->close(); if (raw_server) raw_server->close(); signals.cancel(); };
+    auto close = [&] {
+        shutdown.request_stop();
+        if (rpc_server) rpc_server->close();
+        if (v2_server) v2_server->close();
+        if (raw_server) raw_server->close();
+        signals.cancel();
+    };
     try {
         net::ip::tcp::endpoint endpoint;
         if (config.transport == "rpc") {
             rpc_server = std::make_unique<rpc_channel>(context, config);
             endpoint = rpc_server->server->listen({net::ip::address_v4::loopback(), 0});
+        } else if (config.transport == "v2") {
+            v2_server = std::make_unique<v2_channel>(context, config);
+            endpoint = v2_server->server->listen({net::ip::address_v4::loopback(), 0});
         } else {
             raw_server = std::make_unique<raw_channel>(context, config);
             std::error_code error;
@@ -346,6 +435,11 @@ void serve(options const &config) {
     if (rpc_server) {
         auto const stats = rpc_server->server->stats();
         if (stats.connections || stats.active_calls || stats.request_bytes_in_use || stats.response_bytes_in_use || stats.control_bytes_in_use)
+            throw std::runtime_error{"server retained live resources after drain"};
+    }
+    if (v2_server) {
+        auto const stats = v2_server->server->stats();
+        if (stats.connections || stats.active_calls || stats.request_bytes || stats.response_bytes)
             throw std::runtime_error{"server retained live resources after drain"};
     }
 }

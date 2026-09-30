@@ -1,7 +1,7 @@
 add_executable(unary_bench main.cpp runner.cpp transports.cpp)
 add_executable(scheduler_probe scheduler_probe.cpp)
 lrpc_configure_target(scheduler_probe)
-target_link_libraries(unary_bench PRIVATE lrpc::runtime)
+target_link_libraries(unary_bench PRIVATE lrpc::runtime lrpc::v2)
 lrpc_configure_target(unary_bench)
 if(LRPC_BUILD_JSON)
     add_executable(json_codec_bench json_codec_bench.cpp)
