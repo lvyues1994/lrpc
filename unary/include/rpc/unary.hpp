@@ -18,6 +18,8 @@ namespace rpc {
 
 struct method_descriptor;
 struct service_descriptor;
+struct method_limits;
+template <class Request, class Response, class Policy> struct method;
 struct byte_stream;
 struct stream_open_result;
 struct stream_method_handler;
@@ -271,6 +273,9 @@ public:
     server_builder &operator=(server_builder &&) = delete;
     server_builder &add(method_binding method);
     server_builder &add(std::vector<method_binding> methods);
+    template <class Request, class Response, class Policy, class Service, class Result>
+    server_builder &add(method<Request, Response, Policy> const &operation, Service &service,
+        net::task<Result> (Service::*function)(server_context &, Request const &, Response &), method_limits limits);
     std::unique_ptr<server> build();
 private:
     net::io_context &context_;

@@ -17,6 +17,9 @@
       "LRPC_BUILD_PROTOBUF": true, "LRPC_BUILD_CODEGEN": true}},
     {"name": "protobuf-sanitize", "inherits": "sanitize", "cacheVariables": {
       "LRPC_BUILD_PROTOBUF": true, "LRPC_BUILD_CODEGEN": true}},
+    {"name": "json", "inherits": "debug", "cacheVariables": {"LRPC_BUILD_JSON": true}},
+    {"name": "json-release", "inherits": "release", "cacheVariables": {"LRPC_BUILD_JSON": true}},
+    {"name": "json-sanitize", "inherits": "sanitize", "cacheVariables": {"LRPC_BUILD_JSON": true}},
     {
       "name": "bench", "inherits": "release",
       "cacheVariables": {"LRPC_BUILD_BENCHMARKS": true, "LRPC_BUILD_TESTS": false,
@@ -47,6 +50,9 @@
     {"name": "protobuf", "configurePreset": "protobuf"},
     {"name": "protobuf-release", "configurePreset": "protobuf-release"},
     {"name": "protobuf-sanitize", "configurePreset": "protobuf-sanitize"},
+    {"name": "json", "configurePreset": "json"},
+    {"name": "json-release", "configurePreset": "json-release"},
+    {"name": "json-sanitize", "configurePreset": "json-sanitize"},
     {"name": "bench", "configurePreset": "bench"},
     {"name": "bench-alloc", "configurePreset": "bench-alloc"},
     {"name": "bench-queue", "configurePreset": "bench-queue"},
@@ -61,6 +67,9 @@
     {"name": "protobuf", "configurePreset": "protobuf", "output": {"outputOnFailure": true}},
     {"name": "protobuf-release", "configurePreset": "protobuf-release", "output": {"outputOnFailure": true}},
     {"name": "protobuf-sanitize", "configurePreset": "protobuf-sanitize", "output": {"outputOnFailure": true}},
+    {"name": "json", "configurePreset": "json", "output": {"outputOnFailure": true}},
+    {"name": "json-release", "configurePreset": "json-release", "output": {"outputOnFailure": true}},
+    {"name": "json-sanitize", "configurePreset": "json-sanitize", "output": {"outputOnFailure": true}},
     {"name": "sanitize", "configurePreset": "sanitize", "output": {"outputOnFailure": true}},
     {"name": "tsan", "configurePreset": "tsan", "output": {"outputOnFailure": true}}
   ]

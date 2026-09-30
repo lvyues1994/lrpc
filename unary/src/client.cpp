@@ -346,7 +346,8 @@ admitted_call admit(client_state &state, std::string const &method_name, call_bu
             decoded.message == nullptr || decoded.operations == nullptr ||
             encoded_request_value.operations->size == nullptr || encoded_request_value.operations->encode == nullptr ||
             decoded.operations->decode == nullptr) return {status_code::invalid_argument, {}};
-        request.size = encoded_request_value.operations->size(encoded_request_value.message);
+        if (!encoded_request_value.operations->encode_bounded)
+            request.size = encoded_request_value.operations->size(encoded_request_value.message);
     }
     if (conn.state != phase::ready) return {status_code::unavailable, {}};
     if (token.stop_requested()) return {status_code::cancelled, {}};
@@ -373,12 +374,21 @@ admitted_call admit(client_state &state, std::string const &method_name, call_bu
         request.size > conn.peer.max_frame_size - encoded.written ||
         request.size > state.requests.block_size() - 16 - encoded.written) return {};
     frame.body_offset = 16 + encoded.written;
+    if (encoded_request_value.operations != nullptr) {
+        if (encoded_request_value.operations->encode_bounded) {
+            auto const capacity = std::min<std::size_t>(conn.peer.max_message_size,
+                std::min<std::size_t>(conn.peer.max_frame_size - encoded.written,
+                    state.requests.block_size() - frame.body_offset));
+            auto const body = encoded_request_value.operations->encode_bounded(encoded_request_value.message,
+                {frame.data + frame.body_offset, capacity});
+            if (body.code == wire::error::output_too_small || body.written > capacity) return {};
+            if (body.code != wire::error::none) return {status_code::invalid_argument, {}};
+            request.size = body.written;
+        } else if (!encoded_request_value.operations->encode(encoded_request_value.message,
+            {frame.data + frame.body_offset, request.size})) return {status_code::invalid_argument, {}};
+    } else if (request.size != 0) std::memcpy(frame.data + frame.body_offset, request.data, request.size);
     frame.body_size = request.size;
     frame.size = frame.body_offset + frame.body_size;
-    if (encoded_request_value.operations != nullptr) {
-        if (!encoded_request_value.operations->encode(encoded_request_value.message, {frame.data + frame.body_offset, request.size}))
-            return {status_code::invalid_argument, {}};
-    } else if (request.size != 0) std::memcpy(frame.data + frame.body_offset, request.data, request.size);
     if (conn.state != phase::ready) return {status_code::unavailable, {}};
     if (token.stop_requested()) return {status_code::cancelled, {}};
     if (clock::now() >= deadline) return {status_code::deadline_exceeded, {}};

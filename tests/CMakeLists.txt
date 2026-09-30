@@ -81,6 +81,29 @@ if(LRPC_BUILD_TESTS)
         endforeach()
     endif()
 
+    if(LRPC_BUILD_JSON)
+        add_executable(json_tests json_tests.cpp)
+        target_link_libraries(json_tests PRIVATE lrpc::json)
+        lrpc_configure_target(json_tests)
+        add_test(NAME json COMMAND json_tests)
+        set_tests_properties(json PROPERTIES TIMEOUT 20)
+        add_executable(json_rpc_tests json_rpc_tests.cpp)
+        target_link_libraries(json_rpc_tests PRIVATE lrpc::json lrpc::runtime)
+        lrpc_configure_target(json_rpc_tests)
+        add_test(NAME json_rpc COMMAND json_rpc_tests)
+        set_tests_properties(json_rpc PROPERTIES TIMEOUT 20)
+        if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+            file(GENERATE OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/json-includes.txt"
+                CONTENT "$<JOIN:$<TARGET_PROPERTY:json_tests,INCLUDE_DIRECTORIES>,\n>")
+            add_test(NAME json_compile COMMAND "${CMAKE_COMMAND}"
+                "-DCOMPILER=${CMAKE_CXX_COMPILER}" "-DSOURCE=${PROJECT_SOURCE_DIR}"
+                "-DINCLUDES=${CMAKE_CURRENT_BINARY_DIR}/json-includes.txt"
+                "-DWORK=${CMAKE_CURRENT_BINARY_DIR}/json-compile"
+                -P "${CMAKE_CURRENT_SOURCE_DIR}/json_compile_tests.cmake")
+            set_tests_properties(json_compile PROPERTIES TIMEOUT 30)
+        endif()
+    endif()
+
     if(LRPC_BUILD_PROTOBUF AND LRPC_BUILD_CODEGEN)
         lrpc_generate_cpp(test_protos IMPORT_DIR "${CMAKE_CURRENT_SOURCE_DIR}/proto"
             PROTOS payload.proto echo.proto nested/lite.proto)

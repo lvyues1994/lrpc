@@ -1108,3 +1108,15 @@ net 未提供可分离租约，因此没有实现内核到业务的端到端零�
 帧回收与有界 protobuf Arena 缓存均显式启用，默认配置保留；公开返回类型继续是 net::task<call_result>。
 完整配置、资源和关闭契约见 [运行时升级](runtime-upgrade.md)，生成接口见 [protobuf 用法](protobuf.md)，
 专项性能证据见 [升级实测](../benchmarks/results/2026-09-30-upgrade.md)。Unix 域/TLS（第 9 步）、SO_REUSEPORT 与 §13 全部性能验收不在本阶段交付范围。
+
+### 17.3 普通结构体 JSON
+
+可选 `lrpc::json` 在既有消息 body 中传输 UTF-8 JSON，双方按方法约定 codec；保留 C++14、
+net::task、原有帧、状态与 metadata。非侵入 traits/字段宏映射普通结构体；json_method 选择独立编码策略，
+server_builder 的类型化 add 校验 handler 签名，typed bound_method 支持手写的命名服务 stub。
+GetUser/RenameUser 示例已提供，暂未引入 JSON 代码生成器、HTTP 或 JSON-RPC 2.0 入口。
+
+有界编码回调避免为测量大小重复序列化；channel 在既有 replay budget 内保存单次编码快照，重试复用。
+SAX 解码直接写入拥有型字段，执行完整输入、重复键、UTF-8、数值及深度/数量/逻辑值/临时栈限制；
+没有承诺端到端零拷贝或进程总内存硬上限。protobuf 与默认 codec 的精确大小路径保留。
+字段策略、错误映射、已验证的 RapidJSON 提交及编解码基线见 [JSON 用法](json.md)。

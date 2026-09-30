@@ -30,7 +30,21 @@ struct codec_ops {
     bool (*encode)(void const *, wire::mutable_bytes_view);
     bool (*decode)(wire::bytes_view, void *);
     owned_codec_ops const *owned = nullptr;
+    // Optional one-pass encoding into already budgeted capacity. On failure
+    // written is zero and the output is discarded. upper_bound is cheap and
+    // conservative; it must not serialize or cache the message.
+    wire::encode_result (*encode_bounded)(void const *, wire::mutable_bytes_view) = nullptr;
+    std::size_t (*upper_bound)(void const *) = nullptr;
 };
+
+inline wire::encode_result encode_into(codec_ops const &operations, void const *message,
+                                        wire::mutable_bytes_view output) {
+    if (operations.encode_bounded) return operations.encode_bounded(message, output);
+    auto const size = operations.size(message);
+    if (size > output.size) return {wire::error::output_too_small, 0};
+    if (!operations.encode(message, {output.data, size})) return {wire::error::invalid_argument, 0};
+    return {wire::error::none, size};
+}
 
 template <class Message> codec_ops const &codec_for() {
     static codec_ops const operations{
@@ -43,6 +57,10 @@ template <class Message> codec_ops const &codec_for() {
         }, detail::owned_codec_for<Message>::get()};
     return operations;
 }
+
+struct default_codec_policy {
+    template <class Message> static codec_ops const &operations() { return codec_for<Message>(); }
+};
 
 struct encoded_request {
     void const *message = nullptr;

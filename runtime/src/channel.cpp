@@ -482,6 +482,15 @@ struct guarded_attempt {
     }
 };
 
+codec_ops const prepared_bytes_codec{
+    [](void const *p) { return static_cast<wire::bytes_view const *>(p)->size; },
+    [](void const *p, wire::mutable_bytes_view out) {
+        auto const bytes = *static_cast<wire::bytes_view const *>(p);
+        if (out.size != bytes.size) return false;
+        if (bytes.size) std::memcpy(out.data, bytes.data, bytes.size);
+        return true;
+    }, nullptr};
+
 auto channel_call_body(std::shared_ptr<channel_state> s, std::string method, method_handle handle,
                   channel_buffers buffers, call_options options)
     CO2_BEG(net::task<call_result>, (s, method, handle, buffers, options),
@@ -489,6 +498,7 @@ auto channel_call_body(std::shared_ptr<channel_state> s, std::string method, met
             logical_completion completion; channel_waiter waiter; status_code waited;
             replay_reservation replay_budget;
             std::shared_ptr<client> session; std::vector<std::uint8_t> replay;
+            std::unique_ptr<std::uint8_t[]> prepared_bytes; bool prepared = false;
             std::vector<std::uint8_t> reply; std::vector<std::uint8_t> metadata;
             wire::bytes_view request; wire::mutable_bytes_view response; call_options attempt_options; wire::encode_result head_size;
             std::uint32_t attempt = 0; std::size_t attempt_hooks = 0; bool retrying = false; bool idempotent = false; bool ready = false;
@@ -531,15 +541,36 @@ auto channel_call_body(std::shared_ptr<channel_state> s, std::string method, met
         options.retry.max_backoff < options.retry.initial_backoff || !std::isfinite(options.retry.multiplier) || options.retry.multiplier < 1.0) {
         result.code = status_code::invalid_argument; CO2_RETURN(finish_logical(completion, std::move(result)));
     }
+    if (env->stop_token.stop_requested()) { result.code = status_code::cancelled; CO2_RETURN(finish_logical(completion, std::move(result))); }
+    if (clock::now() >= options.deadline) { result.code = status_code::deadline_exceeded; CO2_RETURN(finish_logical(completion, std::move(result))); }
     try {
         s->start(); request = buffers.request; response = buffers.response;
         if (buffers.typed && (!buffers.encoded.message || !buffers.encoded.operations || !buffers.decoded.message || !buffers.decoded.operations))
             throw std::invalid_argument{"null channel codec"};
-        waiter.bytes = buffers.typed ? buffers.encoded.operations->size(buffers.encoded.message) : request.size;
         head_size = wire::request_head_size({0, {reinterpret_cast<std::uint8_t const *>(method.data()), method.size()}, options.metadata}, true);
         if (head_size.code != wire::error::none) {
             result.code = status_code::invalid_argument; CO2_RETURN(finish_logical(completion, std::move(result)));
         }
+        if (buffers.typed && buffers.encoded.operations->encode_bounded) {
+            auto const &ops = *buffers.encoded.operations;
+            auto capacity = ops.upper_bound ? ops.upper_bound(buffers.encoded.message) : ops.size(buffers.encoded.message);
+            auto const &receive = s->options.connection.connection.receive;
+            if (head_size.written > receive.max_frame_size) throw std::bad_alloc{};
+            capacity = std::min<std::size_t>(capacity, receive.max_message_size);
+            if (!(receive.features & wire::streaming)) capacity = std::min(capacity, receive.max_frame_size - head_size.written);
+            reply_size = options.retry.max_attempts > 1 ? receive.max_message_size : 0;
+            auto const meta_size = options.retry.max_attempts > 1 ? options.response_metadata.size : 0;
+            auto const available = s->options.replay_bytes - s->replay_used;
+            if (reply_size > available || meta_size > available - reply_size) throw std::bad_alloc{};
+            capacity = std::min(capacity, available - reply_size - meta_size);
+            replay_charge = capacity + reply_size + meta_size;
+            s->replay_used += replay_charge; replay_budget.owner = s.get(); replay_budget.bytes = replay_charge;
+            prepared_bytes = std::make_unique<std::uint8_t[]>(capacity);
+            auto const encoded = ops.encode_bounded(buffers.encoded.message, {prepared_bytes.get(), capacity});
+            if (encoded.code == wire::error::output_too_small || encoded.written > capacity) throw std::bad_alloc{};
+            if (encoded.code != wire::error::none) throw std::invalid_argument{"request encoding failed"};
+            request = {prepared_bytes.get(), encoded.written}; waiter.bytes = encoded.written; prepared = true;
+        } else waiter.bytes = buffers.typed ? buffers.encoded.operations->size(buffers.encoded.message) : request.size;
         // A request that cannot fit even on an empty local session must never
         // occupy a waiting permit. Full head grammar is validated by unary.
         if (waiter.bytes > s->options.connection.connection.receive.max_message_size ||
@@ -551,19 +582,21 @@ auto channel_call_body(std::shared_ptr<channel_state> s, std::string method, met
         if (options.retry.max_attempts > 1) {
             if (waiter.bytes > s->options.connection.connection.receive.max_message_size) throw std::invalid_argument{"replay exceeds message limit"};
             reply_size = buffers.typed ? s->options.connection.connection.receive.max_message_size : response.size;
-            if (waiter.bytes > s->options.replay_bytes || reply_size > s->options.replay_bytes - waiter.bytes ||
-                options.response_metadata.size > s->options.replay_bytes - waiter.bytes - reply_size) throw std::bad_alloc{};
-            replay_charge = waiter.bytes + reply_size + options.response_metadata.size;
-            if (replay_charge > s->options.replay_bytes - s->replay_used) throw std::bad_alloc{};
-            s->replay_used += replay_charge; replay_budget.owner = s.get(); replay_budget.bytes = replay_charge;
-            replay.resize(waiter.bytes);
-            if (buffers.typed) {
-                if (!buffers.encoded.operations->encode(buffers.encoded.message, {replay.data(), replay.size()})) throw std::invalid_argument{"replay encoding failed"};
-            } else if (request.size) {
-                if (!request.data) throw std::invalid_argument{"null channel request"};
-                std::memcpy(replay.data(), request.data, request.size);
+            if (!prepared) {
+                if (waiter.bytes > s->options.replay_bytes || reply_size > s->options.replay_bytes - waiter.bytes ||
+                    options.response_metadata.size > s->options.replay_bytes - waiter.bytes - reply_size) throw std::bad_alloc{};
+                replay_charge = waiter.bytes + reply_size + options.response_metadata.size;
+                if (replay_charge > s->options.replay_bytes - s->replay_used) throw std::bad_alloc{};
+                s->replay_used += replay_charge; replay_budget.owner = s.get(); replay_budget.bytes = replay_charge;
+                replay.resize(waiter.bytes);
+                if (buffers.typed) {
+                    if (!buffers.encoded.operations->encode(buffers.encoded.message, {replay.data(), replay.size()})) throw std::invalid_argument{"replay encoding failed"};
+                } else if (request.size) {
+                    if (!request.data) throw std::invalid_argument{"null channel request"};
+                    std::memcpy(replay.data(), request.data, request.size);
+                }
+                request = {replay.data(), replay.size()};
             }
-            request = {replay.data(), replay.size()};
             reply.resize(reply_size);
             metadata.resize(options.response_metadata.size);
             response = {reply.data(), reply.size()};
@@ -600,7 +633,8 @@ auto channel_call_body(std::shared_ptr<channel_state> s, std::string method, met
         }
         try {
             operation = buffers.typed && options.retry.max_attempts == 1 ?
-                session->call_encoded(method, buffers.encoded, buffers.decoded, attempt_options) :
+                session->call_encoded(method, prepared ? encoded_request{&request, &prepared_bytes_codec} : buffers.encoded,
+                    buffers.decoded, attempt_options) :
                 session->call(method, request, response, attempt_options);
         } catch (std::bad_alloc const &) { result.code = status_code::resource_exhausted; run_after(*s, info, result, attempt_hooks); session.reset(); break; }
         catch (...) { result.code = status_code::internal; run_after(*s, info, result, attempt_hooks); session.reset(); break; }

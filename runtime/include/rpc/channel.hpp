@@ -84,7 +84,7 @@ struct channel_options {
     std::size_t max_waiting_calls = 0; // Fast rejection is the default.
     std::size_t max_waiting_bytes = 0;
     std::size_t max_logical_calls = 1024; // Includes active, queued and retry-backoff calls.
-    std::size_t replay_bytes = 16U * 1024U * 1024U; // Owned request replay, attempt reply and metadata.
+    std::size_t replay_bytes = 16U * 1024U * 1024U; // Prepared requests, request replay, attempt reply and metadata.
     std::chrono::milliseconds connect_timeout{5000};
     std::chrono::milliseconds initial_backoff{100};
     std::chrono::milliseconds max_backoff{30000};

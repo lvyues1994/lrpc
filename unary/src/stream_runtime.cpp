@@ -123,6 +123,7 @@ struct stream_state final : byte_stream, std::enable_shared_from_this<stream_sta
     clock::time_point deadline = clock::time_point::max();
     deadline_node timeout;
     net::stop_source stop;
+    net::stop_token parent_stop;
     inplace<net::stop_callback<cancel_stream>> cancellation;
     std::shared_ptr<notice> cancel_notice;
     std::function<void(call_result const &)> completion_observer;
@@ -253,6 +254,7 @@ std::shared_ptr<stream_state> stream_peer::admit(std::uint32_t id, method_kind k
     return s;
 }
 void stream_peer::arm(std::shared_ptr<stream_state> const &s, net::stop_token token) {
+    s->parent_stop = token;
     s->cancel_notice = std::make_shared<notice>(gate, auxiliary_budget, [weak = std::weak_ptr<stream_state>{s}](stream_peer &peer) {
         if (auto stream = weak.lock()) peer.complete(stream, call_result{status_code::cancelled}, true);
     });
@@ -426,6 +428,8 @@ auto stream_write_task(std::shared_ptr<stream_state> s, byte_buffer message, enc
     p = s->owner.lock(); CO2_AWAIT_SET(env, net::this_coro::environment);
     if (!p || &env->executor.context() != &p->conn.context || !guard.enter(s->writing)) CO2_RETURN(status_code::failed_precondition);
     if (s->ended) CO2_RETURN(s->result.code == status_code::ok ? status_code::failed_precondition : s->result.code);
+    if (s->parent_stop.stop_requested() || env->stop_token.stop_requested()) { p->complete(s, call_result{status_code::cancelled}, true); CO2_RETURN(status_code::cancelled); }
+    if (clock::now() >= s->deadline) { p->complete(s, call_result{status_code::deadline_exceeded}, true); CO2_RETURN(status_code::deadline_exceeded); }
     if (s->local_half) CO2_RETURN(status_code::failed_precondition);
     if (half) {
         cleanup.peer = p; cleanup.stream = s; cleanup.armed = true;
@@ -440,14 +444,28 @@ auto stream_write_task(std::shared_ptr<stream_state> s, byte_buffer message, enc
         if (use_codec) {
             if (!encoded.message || !encoded.operations || !encoded.operations->size || !encoded.operations->encode ||
                 (encoded.operations->owned && !encoded.operations->owned->encode)) CO2_RETURN(status_code::invalid_argument);
-            size = encoded.operations->size(encoded.message);
-            if (size > p->conn.peer.max_message_size) CO2_RETURN(status_code::resource_exhausted);
-            if (encoded.operations->owned) {
-                if (!encoded.operations->owned->encode(encoded.message, message) || message.size() != size) CO2_RETURN(status_code::invalid_argument);
-            } else {
+            if (encoded.operations->encode_bounded && !encoded.operations->owned) {
+                if (!s->send_descriptor) s->send_descriptor = std::make_unique<buffer_builder>(9, p->send_budget);
+                auto const &ops = *encoded.operations;
+                size = ops.upper_bound ? ops.upper_bound(encoded.message) : ops.size(encoded.message);
+                size = std::min<std::size_t>(size, p->conn.peer.max_message_size);
+                size = std::min(size, p->send_budget->limit() - p->send_budget->used());
+                if (!s->client_side && s->binding) size = std::min(size, s->binding->max_response_bytes);
                 builder = std::make_unique<buffer_builder>(size, p->send_budget);
-                if (!encoded.operations->encode(encoded.message, builder->buffer())) CO2_RETURN(status_code::invalid_argument);
-                message = builder->finish(); builder.reset();
+                auto const encoded_result = ops.encode_bounded(encoded.message, builder->buffer());
+                if (encoded_result.code == wire::error::output_too_small || encoded_result.written > size) CO2_RETURN(status_code::resource_exhausted);
+                if (encoded_result.code != wire::error::none) CO2_RETURN(status_code::invalid_argument);
+                message = builder->finish(encoded_result.written); builder.reset();
+            } else {
+                size = encoded.operations->size(encoded.message);
+                if (size > p->conn.peer.max_message_size) CO2_RETURN(status_code::resource_exhausted);
+                if (encoded.operations->owned) {
+                    if (!encoded.operations->owned->encode(encoded.message, message) || message.size() != size) CO2_RETURN(status_code::invalid_argument);
+                } else {
+                    builder = std::make_unique<buffer_builder>(size, p->send_budget);
+                    if (!encoded.operations->encode(encoded.message, builder->buffer())) CO2_RETURN(status_code::invalid_argument);
+                    message = builder->finish(); builder.reset();
+                }
             }
         }
         size = message.size();
@@ -487,6 +505,8 @@ auto stream_write_task(std::shared_ptr<stream_state> s, byte_buffer message, enc
         cleanup.peer = p; cleanup.stream = s; cleanup.armed = true;
         while (s->kind != method_kind::unary && cost > s->send_credit && !s->ended) CO2_AWAIT(s->credit.wait());
         if (s->ended) CO2_RETURN(s->result.code);
+        if (s->parent_stop.stop_requested() || env->stop_token.stop_requested()) { p->complete(s, call_result{status_code::cancelled}, true); CO2_RETURN(status_code::cancelled); }
+        if (clock::now() >= s->deadline) { p->complete(s, call_result{status_code::deadline_exceeded}, true); CO2_RETURN(status_code::deadline_exceeded); }
         if (s->kind != method_kind::unary) s->send_credit -= cost;
         offset = 0;
         do {

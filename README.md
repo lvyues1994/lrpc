@@ -13,6 +13,7 @@
 | `lrpc::unary` | 单分片 TCP、原始字节与类型化调用、固定调用槽、共享精确截止、方法绑定、server_builder、状态说明、双向 metadata、过载拒绝及 GOAWAY 排空 |
 | `lrpc::runtime` | 固定分片线程、连接池、静态/DNS 解析、重连退避、平衡、有限排队、重试、interceptor、追踪及指标导出 |
 | `lrpc::protobuf` | 可选的 protobuf codec、类型化服务适配器及每调用 Arena，带 2 KiB 内联初始块 |
+| `lrpc::json` | 可选的普通结构体 JSON 映射、严格 SAX 校验、有界单次编码和类型化方法/stub |
 | `protoc-gen-rpc` | 生成冷绑定的客户端 Stub、服务端接口、方法描述符、builder 注册和每方法容量配置 |
 
 流式 profile 支持上传流、下载流、双向流、MESSAGE 分片、窗口背压、半关闭和跨分片调用；生成器覆盖四种方法。
@@ -75,6 +76,14 @@ ctest --preset protobuf
 消息代码 `.pb.h/.pb.cc` 与 RPC 代码 `.rpc.hpp/.rpc.cpp` 分别由 `--cpp_out` 和 `--rpc_out` 生成，
 项目内可用 `lrpc_generate_cpp` 一起生成并链接。支持 proto2、proto3、optional、lite、导入和嵌套消息。
 手动生成命令、CMake 接入、Arena 生命周期以及私有依赖目录的运行环境见 [protobuf 与 metadata 用法](docs/protobuf.md)。
+
+### 普通结构体 JSON
+
+启用 `LRPC_BUILD_JSON=ON`，提供独立 RapidJSON 源码目录或安装包，链接 `lrpc::json`。
+`RPC_JSON_FIELDS(Type, ...)` 映射字段，`json_method<Request, Reply>` 声明方法类型；
+`builder.add(method, service, &Service::GetUser, limits)` 注册，服务 stub 保持 `users.GetUser(request, reply)` 调用。
+JSON 使用现有 lrpc body 与 metadata，双方法示例见 [json_users.cpp](examples/json_users.cpp)，
+构建、字段策略、容量限制和性能基线见 [JSON 用法](docs/json.md)。
 
 ## 调用与资源约定
 

@@ -144,3 +144,10 @@ uv run --offline python benchmarks/analyze_allocations.py \
 它不是全部准入调用的排队时间，也不包括内核发送等待。直方图桶的上界为 `2^index` ns，报告分位数时须标为桶上界。
 raw net 未被该探针观测，输出 `null`；跨进程客户端的服务端响应队列也为 `null`。
 该开关增加内部块描述符大小，可能改变固定预算下的块数，因此队列诊断也不参与正式性能验收。
+
+## JSON codec 基线
+
+启用 `LRPC_BUILD_JSON=ON` 后，`json_codec_bench [iterations]` 比较有界单次编码、size 后 encode 和 SAX 解码，
+使用有效 UTF-8 字符串与结构体字段。输出每组的线上字节、p50/p99/平均纳秒；默认每组 100000 次，预热 1000 次。
+解码计时包含目标容器分配与结果比较，不包含 TCP、RPC 调度或 metadata，不能用于网络 p99 验收。
+构建与约束见 [JSON 用法](../docs/json.md)。

@@ -77,7 +77,7 @@ net::task<rpc::status_code> service::echo(rpc::server_context &, byte_message co
 
 void typed_adapter(rpc::status_code expected = rpc::status_code::ok) {
     service impl;
-    auto binding = rpc::bind_method(rpc::method<byte_message, byte_message>{"custom/Echo"}, impl, &service::echo, {1, 2});
+    auto binding = rpc::bind_method<byte_message, byte_message, service, rpc::status_code>(rpc::method<byte_message, byte_message>{"custom/Echo"}, impl, &service::echo, {1, 2});
     auto copy = binding; binding = {};
     CHECK(copy.handler == copy.owned_handler.get());
     net::io_context context{net::default_backend, net::single_thread_hint};

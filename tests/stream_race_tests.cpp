@@ -71,5 +71,34 @@ void invalid_success_and_repeated_settings() {
         fixture f; f.pipe->feed(f.settings_frame); f.context.poll(); CHECK(!f.client->ready());
     }
 }
+struct encoding_action { net::stop_source *stop; rpc::clock::time_point deadline; bool cancel; };
+void stop_during_encoding(bool cancel) {
+    fixture f; net::stop_source stop; rpc::stream_open_result opened; rpc::call_options options;
+    if (!cancel) options.deadline = rpc::clock::now() + std::chrono::milliseconds{20};
+    net::run_async(f.context.get_executor(), stop.get_token(), nullptr,
+        [&](rpc::stream_open_result r) { opened = std::move(r); }, [](std::exception_ptr e) { std::rethrow_exception(e); })
+        ([&] { return f.client->open_stream("Upload", rpc::method_kind::client_streaming, options); });
+    f.context.poll(); f.flush(); CHECK(opened.code == rpc::status_code::ok); f.pipe->output.clear();
+    encoding_action action{&stop, options.deadline, cancel};
+    rpc::codec_ops ops{
+        [](void const *) -> std::size_t { return 1; },
+        [](void const *, rpc::wire::mutable_bytes_view) { return false; }, nullptr, nullptr,
+        [](void const *p, rpc::wire::mutable_bytes_view bytes) {
+            auto const &a = *static_cast<encoding_action const *>(p);
+            if (a.cancel) a.stop->request_stop(); else std::this_thread::sleep_until(a.deadline);
+            bytes.data[0] = 42; return rpc::wire::encode_result{rpc::wire::error::none, 1};
+        }, [](void const *) -> std::size_t { return 1; }};
+    rpc::status_code result = rpc::status_code::unknown;
+    net::run_async(f.context.get_executor(), [&](rpc::status_code r) { result = r; }, [](std::exception_ptr e) { std::rethrow_exception(e); })
+        ([&] { return opened.stream->write_encoded({&action, &ops}); });
+    f.context.poll(); f.flush();
+    CHECK(result == (cancel ? rpc::status_code::cancelled : rpc::status_code::deadline_exceeded));
+    std::size_t offset = 0;
+    while (offset < f.pipe->output.size()) {
+        auto frame = rpc::wire::decode_frame({f.pipe->output.data() + offset, f.pipe->output.size() - offset}, {1024, 1024, rpc::wire::streaming});
+        CHECK(frame.code == rpc::wire::error::none && frame.value.header.type != rpc::wire::frame_type::message); offset += frame.consumed;
+    }
+    CHECK(f.client->stats().active_calls == 0 && f.client->stats().request_bytes_in_use == 0);
 }
-int main() { deadline_during_write(); foreign_cancel(); invalid_success_and_repeated_settings(); }
+}
+int main() { deadline_during_write(); foreign_cancel(); invalid_success_and_repeated_settings(); stop_during_encoding(true); stop_during_encoding(false); }
