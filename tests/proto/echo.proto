@@ -8,9 +8,7 @@ message EchoRequest {
 }
 message EchoReply { bytes payload = 1; }
 service Echo {
-  rpc RoundTrip(EchoRequest) returns (EchoReply) {
-    option idempotency_level = IDEMPOTENT;
-  }
+  rpc RoundTrip(EchoRequest) returns (EchoReply);
   rpc Required(test.messages.Container.Item) returns (test.messages.Container.Item);
   rpc delete(EchoRequest) returns (EchoReply);
 }
@@ -21,5 +19,5 @@ service Mixed {
   rpc Download(EchoRequest) returns(stream EchoReply);
   rpc Chat(stream EchoRequest) returns(stream EchoReply);
 }
-// A valid method name must not shadow the descriptor used by the Stub ctor.
-service Shadow { rpc Shadow_service_descriptor(EchoRequest) returns(EchoReply); }
+// A method may share its name with the generated namespace-scope function.
+service Shadow { rpc Shadow_bindings(EchoRequest) returns(EchoReply); }

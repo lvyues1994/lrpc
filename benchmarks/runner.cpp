@@ -57,7 +57,6 @@ void launch(trial_state &state, slot &storage, rpc::clock::time_point scheduled)
     state.result.last_offer = record.offered;
     auto const sequence = static_cast<std::uint64_t>(storage.sample_index);
     std::memcpy(storage.request.data(), &sequence, sizeof(sequence));
-    state.transport.prepare(storage);
     ++state.active;
     if (state.measuring) state.result.maximum_inflight = std::max(state.result.maximum_inflight, state.active);
     net::run_async(state.context.get_executor(), [&state, &storage] {
@@ -129,10 +128,6 @@ auto trial(trial_state &state)
     state.measuring = true; state.total = state.config.iterations; state.offered = 0; state.completed = 0;
     state.transport.begin_measurement();
     std::fill(state.result.samples.begin(), state.result.samples.end(), sample{});
-#ifdef LRPC_ENABLE_DIAGNOSTICS
-    rpc::detail::local_queue_capture() = {};
-    rpc::detail::local_queue_capture().active = true;
-#endif
 #ifdef LRPC_BENCH_COUNT_ALLOCATIONS
     if (!state.config.allocation_trace.empty()) begin_allocation_trace();
 #endif
@@ -143,10 +138,6 @@ auto trial(trial_state &state)
     state.result.finished = rpc::clock::now(); state.result.new_calls = allocations() - alloc_start;
 #ifdef LRPC_BENCH_COUNT_ALLOCATIONS
     end_allocation_trace();
-#endif
-#ifdef LRPC_ENABLE_DIAGNOSTICS
-    state.result.queues = rpc::detail::local_queue_capture().metrics;
-    rpc::detail::local_queue_capture().active = false;
 #endif
     state.result.cpu = cpu_now(); state.result.cpu.user_ns -= cpu_start.user_ns; state.result.cpu.system_ns -= cpu_start.system_ns;
     if (state.failure) std::rethrow_exception(state.failure);
@@ -175,16 +166,12 @@ measurements run(options const &config) {
 #ifdef LRPC_BENCH_COUNT_ALLOCATIONS
     end_allocation_trace();
 #endif
-#ifdef LRPC_ENABLE_DIAGNOSTICS
-    rpc::detail::local_queue_capture().active = false;
-#endif
     // A callback exception must not unwind driver-owned slots before pending
     // continuations have consumed their cancellation completions.
     for (;;) {
         try { context.run(); break; }
         catch (...) { fail(state, std::current_exception()); }
     }
-    transport->join();
     if (state.failure) std::rethrow_exception(state.failure);
     if (state.completed != config.iterations || state.active != 0) throw std::runtime_error{"incomplete trial"};
     result.samples.resize(config.iterations);

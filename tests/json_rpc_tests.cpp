@@ -1,15 +1,34 @@
-#include <rpc/json.hpp>
-#include <rpc/channel.hpp>
-#include <net/run_async.hpp>
 #include "check.hpp"
+
+#include <rpc/channel.hpp>
+#include <rpc/json.hpp>
+
+#include <net/run_async.hpp>
+
 #include <array>
 #include <iostream>
+#include <string>
 
-struct JsonMessage { std::string text; bool retry = false; };
-RPC_JSON_FIELDS(JsonMessage, text, retry);
+struct JsonMessage { std::string text; };
+RPC_JSON_FIELDS(JsonMessage, text);
 struct JsonReply { std::string text; };
 RPC_JSON_FIELDS(JsonReply, text);
+struct MemoryLimited { std::string text; };
+RPC_JSON_FIELDS(MemoryLimited, text);
+namespace rpc {
+template <> struct json_options<MemoryLimited> {
+    static json_limits limits() noexcept {
+        json_limits l;
+        l.max_decoded_bytes = 8;
+        l.max_string_bytes = 1024;
+        l.max_scratch_bytes = 512;
+        return l;
+    }
+};
+} // namespace rpc
+
 namespace {
+
 unsigned encodes = 0;
 struct measured_policy {
     template <class T> static rpc::codec_ops const &operations() {
@@ -18,101 +37,150 @@ struct measured_policy {
             result.encode_bounded = [](void const *p, rpc::wire::mutable_bytes_view out) {
                 if (std::is_same<T, JsonMessage>::value) ++encodes;
                 return rpc::json_codec<T>::encode_bounded(*static_cast<T const *>(p), out);
-            }; return result;
-        }(); return ops;
+            };
+            return result;
+        }();
+        return ops;
     }
 };
-using operation_type = rpc::method<JsonMessage, JsonReply, measured_policy>;
+
+using echo_method = rpc::method<JsonMessage, JsonReply, measured_policy>;
+echo_method const echo_operation{"json/Echo"};
+rpc::json_method<MemoryLimited, JsonReply> const limited_operation{"json/Limited"};
+
+constexpr std::uint32_t frame_limit = 4096;
+constexpr std::size_t response_limit = 2048;
+
 struct service {
-    JsonMessage *original = nullptr; unsigned invoked = 0; unsigned retries = 0;
-    std::string first;
-    net::task<rpc::status_code> Echo(rpc::server_context &, JsonMessage const &, JsonReply &);
+    unsigned invoked = 0;
+    net::task<rpc::status_code> Echo(rpc::server_context &, JsonMessage const &request, JsonReply &reply);
+    net::task<rpc::status_code> Limited(rpc::server_context &, MemoryLimited const &, JsonReply &reply);
 };
-auto echo(service *self, JsonMessage const *request, JsonReply *reply)
-    CO2_BEG(net::task<rpc::status_code>, (self, request, reply)) {
+
+auto echo(service *self, std::string const *text, JsonReply *reply)
+    CO2_BEG(net::task<rpc::status_code>, (self, text, reply)) {
     ++self->invoked;
-    if (request->retry) {
-        ++self->retries;
-        if (self->retries == 1) {
-            self->first = request->text;
-            self->original->text = "mutated after first attempt";
-            CO2_RETURN(rpc::status_code::unavailable);
-        }
-        CHECK(request->text == self->first);
-    }
-    reply->text = request->text; CO2_RETURN(rpc::status_code::ok);
+    reply->text = *text;
+    CO2_RETURN(rpc::status_code::ok);
 }
 CO2_END
-net::task<rpc::status_code> service::Echo(rpc::server_context &, JsonMessage const &req, JsonReply &resp) { return echo(this, &req, &resp); }
-auto run(rpc::client *client, rpc::channel *channel, net::ip::tcp::endpoint endpoint, service *impl,
-         rpc::bound_method<JsonMessage, JsonReply, measured_policy> bound, operation_type operation, bool streaming)
-    CO2_BEG(net::task<>, (client, channel, endpoint, impl, bound, operation, streaming),
-        rpc::status_code ready; rpc::call_result result; rpc::call_options options;
-        JsonMessage request; JsonReply response; unsigned calls = 0; std::string raw; std::array<std::uint8_t, 64> bytes{};) {
-    options.timeout = std::chrono::seconds{2};
-    if (channel) { CO2_AWAIT_SET(ready, channel->warmup(options)); }
-    else { CO2_AWAIT_SET(ready, client->connect(endpoint)); }
-    CHECK(ready == rpc::status_code::ok);
-    request.text.assign(180, 'x'); encodes = 0;
-    CO2_AWAIT_SET(result, bound(request, response, options));
-    CHECK(result.code == rpc::status_code::ok && response.text == request.text && encodes == 1);
-    if (streaming && !channel) {
-        // upper_bound exceeds the entire 1024-byte budget; actual JSON fits
-        // with its descriptor, so conservative capacity must leave room for it.
-        CHECK(client->stats().active_calls == 0);
-    }
-    if (streaming) {
-        request.text.assign(600, 'x'); encodes = 0;
-        CO2_AWAIT_SET(result, bound(request, response, options));
-        CHECK(result.code == rpc::status_code::ok && response.text == request.text && encodes == 1);
-    }
-    calls = impl->invoked; raw = R"({"text":"a","text":"b"})";
-    CO2_AWAIT_SET(result, client->call(operation.name, {reinterpret_cast<std::uint8_t const *>(raw.data()), raw.size()}, {bytes.data(), bytes.size()}, options));
-    CHECK(result.code == rpc::status_code::invalid_argument && impl->invoked == calls);
+
+net::task<rpc::status_code> service::Echo(rpc::server_context &, JsonMessage const &request, JsonReply &reply) {
+    return echo(this, &request.text, &reply);
+}
+net::task<rpc::status_code> service::Limited(rpc::server_context &, MemoryLimited const &request, JsonReply &reply) {
+    return echo(this, &request.text, &reply);
+}
+
+std::vector<rpc::method_binding> bindings(service &implementation) {
+    std::vector<rpc::method_binding> result;
+    result.push_back(rpc::bind_method(echo_operation, implementation, &service::Echo, {response_limit, 64}));
+    result.push_back(rpc::bind_method(limited_operation, implementation, &service::Limited));
+    return result;
+}
+
+rpc::connection_options small_frames() {
+    rpc::connection_options options;
+    options.receive.max_frame_size = frame_limit;
+    options.receive.max_message_size = frame_limit;
+    return options;
+}
+
+auto run(rpc::client *client, rpc::channel *channel, net::ip::tcp::endpoint endpoint, service *implementation,
+         rpc::call_target target, rpc::bound_method<JsonMessage, JsonReply, measured_policy> call)
+    CO2_BEG(net::task<>, (client, channel, endpoint, implementation, target, call), rpc::status_code ready;
+            rpc::call_result result; rpc::call_spec spec; JsonMessage request; JsonReply response;
+            MemoryLimited limited; unsigned calls = 0; std::string raw; std::array<std::uint8_t, 64> bytes{};) {
     if (channel) {
-        impl->original = &request; request.text = "snapshot"; request.retry = true; encodes = 0;
-        options.retry.max_attempts = 2; options.retry.initial_backoff = std::chrono::milliseconds{0};
-        // The convenience call must consume the same idempotency contract as bind.
-        CO2_AWAIT_SET(result, rpc::call(*client, operation, request, response, options));
-        CHECK(result.code == rpc::status_code::ok && result.attempts == 2 && response.text == "snapshot" && request.text != response.text && encodes == 1);
-        CHECK(channel->metrics().replay_bytes_in_use == 0);
-        options.retry.max_attempts = 1; request.retry = false;
-        request.text.assign(6000, 'x'); encodes = 0;
-        CO2_AWAIT_SET(result, bound(request, response, options)); CHECK(result.code == rpc::status_code::resource_exhausted);
-        CHECK(channel->metrics().replay_bytes_in_use == 0);
+        CO2_AWAIT_SET(ready, channel->wait_ready(rpc::clock::now() + std::chrono::seconds{5}));
+    } else {
+        CO2_AWAIT_SET(ready, client->connect(endpoint));
     }
-    options.deadline = rpc::clock::now(); encodes = 0;
-    CO2_AWAIT_SET(result, bound(request, response, options));
+    CHECK(ready == rpc::status_code::ok);
+
+    // Encoded once, straight into the frame and the reply, though the JSON
+    // bounds (escapes counted at their worst) exceed the room in both.
+    request.text.assign(1500, 'x');
+    encodes = 0;
+    CO2_AWAIT_SET(result, call(request, response));
+    CHECK(result.code == rpc::status_code::ok && response.text == request.text && encodes == 1);
+
+    // Neither a request beyond the frame nor a reply beyond the method's
+    // limit is sent.
+    request.text.assign(frame_limit, 'x');
+    calls = implementation->invoked;
+    CO2_AWAIT_SET(result, call(request, response));
+    CHECK(result.code == rpc::status_code::resource_exhausted && result.not_executed);
+    CHECK(implementation->invoked == calls);
+    request.text.assign(response_limit, 'x');
+    CO2_AWAIT_SET(result, call(request, response));
+    CHECK(result.code == rpc::status_code::internal && implementation->invoked == calls + 1);
+
+    // A duplicate key is rejected before the handler runs.
+    calls = implementation->invoked;
+    raw = R"({"text":"a","text":"b"})";
+    CO2_AWAIT_SET(result, target.call(target.bind(echo_operation.name), {raw.data(), raw.size()},
+                                      {bytes.data(), bytes.size()}, nullptr, nullptr));
+    CHECK(result.code == rpc::status_code::invalid_argument && implementation->invoked == calls);
+
+    // Running out of decode memory is not the caller's mistake.
+    limited.text = "123456789";
+    CO2_AWAIT_SET(result, rpc::bind(target, limited_operation)(limited, response));
+    CHECK(result.code == rpc::status_code::resource_exhausted && implementation->invoked == calls);
+
+    // An expired deadline fails before anything is encoded.
+    request.text = "late";
+    spec.deadline = rpc::clock::now();
+    encodes = 0;
+    CO2_AWAIT_SET(result, call(request, response, &spec));
     CHECK(result.code == rpc::status_code::deadline_exceeded && encodes == 0);
+    if (channel) channel->close();
     CO2_RETURN();
 }
 CO2_END
-void round_trip(bool use_channel, bool streaming) {
-    net::io_context ctx{net::epoll, net::single_thread_hint}; service impl;
-    operation_type operation{"json/Echo", rpc::idempotency::no_side_effects};
-    rpc::server_options server_options; server_options.connection.receive.max_frame_size = streaming ? 256 : 512;
-    server_options.connection.receive.max_message_size = 4096;
-    if (streaming) { server_options.connection.receive.features |= rpc::wire::streaming; server_options.connection.receive.initial_stream_window = 4096; }
-    rpc::server_builder builder{ctx, server_options}; builder.add(operation, impl, &service::Echo, {streaming ? 4096U : 256U, 64}); auto server = builder.build();
-    auto endpoint = server->listen({net::ip::address_v4::loopback(), 0});
-    rpc::client_options client_options; client_options.connection.receive = server_options.connection.receive;
-    client_options.request_bytes = 1024;
-    std::unique_ptr<rpc::client> client; rpc::channel *channel = nullptr;
-    if (use_channel) {
-        rpc::channel_options options; options.connection = client_options; options.resolve = rpc::make_static_resolver({endpoint});
-        options.max_connections = 1; options.replay_bytes = 16384;
-        auto owned = rpc::make_channel(ctx, options); channel = owned.get(); client = std::move(owned);
-    } else client = rpc::make_client(ctx, client_options);
-    std::exception_ptr error; bool complete = false;
-    auto close = [&] { client->close(); server->close(); };
-    net::run_async(ctx.get_executor(), [&] { complete = true; close(); }, [&](std::exception_ptr e) { error = e; close(); })
-        ([&] { return run(client.get(), channel, endpoint, &impl, rpc::bind(*client, operation), operation, streaming); });
-    ctx.run(); if (error) std::rethrow_exception(error); CHECK(complete);
-    CHECK(client->stats().active_calls == 0 && client->stats().request_bytes_in_use == 0);
-    CHECK(server->stats().active_calls == 0 && server->stats().response_bytes_in_use == 0);
+
+void round_trip(bool through_channel) {
+    net::io_context context{net::default_backend, net::single_thread_hint};
+    rpc::shard shard{context};
+    service implementation;
+    rpc::server_options server_options;
+    server_options.connection = small_frames();
+    rpc::server server{shard, bindings(implementation), server_options};
+    auto const endpoint = server.listen({net::ip::address_v4::loopback(), 0});
+    rpc::client_options client_options;
+    client_options.connection = small_frames();
+    rpc::client client{shard, client_options};
+    rpc::channel_options channel_options;
+    channel_options.client = client_options;
+    rpc::channel channel{shard, {endpoint}, channel_options};
+    std::exception_ptr failure;
+    auto close = [&] {
+        channel.close();
+        client.close();
+        server.close();
+    };
+    net::run_async(context.get_executor(), close, [&](std::exception_ptr error) {
+        failure = error;
+        close();
+    })([&] {
+        auto const target = through_channel ? rpc::call_target{channel} : rpc::call_target{client};
+        return run(&client, through_channel ? &channel : nullptr, endpoint, &implementation, target,
+                   rpc::bind(target, echo_operation));
+    });
+    context.run();
+    if (failure) std::rethrow_exception(failure);
+    CHECK(server.stats().active_calls == 0 && server.stats().response_bytes == 0);
 }
-}
+
+} // namespace
+
 int main() {
-    try { for (bool c : {false, true}) for (bool s : {false, true}) round_trip(c, s); std::cout << "PASS JSON direct/channel, retries, streamed profile and budgets\n"; }
-    catch (std::exception const &e) { std::cerr << e.what() << '\n'; return 1; }
+    try {
+        round_trip(false);
+        round_trip(true);
+        std::cout << "PASS JSON calls through a client and a channel, bounds and strict input\n";
+    } catch (std::exception const &error) {
+        std::cerr << error.what() << '\n';
+        return 1;
+    }
 }

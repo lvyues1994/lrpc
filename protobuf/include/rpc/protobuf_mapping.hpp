@@ -54,7 +54,7 @@ template <class Message> struct mapped_protobuf_codec {
         static codec_ops const ops{
             [](void const *p) { return size(*static_cast<Message const *>(p)); },
             [](void const *p, wire::mutable_bytes_view out) { return encode(*static_cast<Message const *>(p), out); },
-            [](wire::bytes_view in, void *p) { return decode(in, *static_cast<Message *>(p)); }, nullptr,
+            [](wire::bytes_view in, void *p) { return decode(in, *static_cast<Message *>(p)); },
             [](void const *p, wire::mutable_bytes_view out) { return encode_bounded(*static_cast<Message const *>(p), out); },
             [](void const *p) { return mapping::upper_bound(*static_cast<Message const *>(p)); }};
         return ops;

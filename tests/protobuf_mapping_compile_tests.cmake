@@ -3,11 +3,15 @@ set(flags)
 foreach(path IN LISTS include_paths)
     list(APPEND flags "-I${path}")
 endforeach()
+file(STRINGS "${DEFINITIONS}" definitions)
+foreach(definition IN LISTS definitions)
+    list(APPEND flags "-D${definition}")
+endforeach()
 file(MAKE_DIRECTORY "${WORK}")
 set(prelude "#include \"${SOURCE}/examples/protobuf_users.hpp\"\n")
 set(positive [=[
 void invoke(rpc::client &c) {
-    example::UserStub users{c, example::users_contract(rpc::mapped_protobuf_codec_policy{})};
+    example::UserStub<rpc::mapped_protobuf_codec_policy> users{c, example::users_contract(rpc::mapped_protobuf_codec_policy{})};
     example::GetUserRequest request; example::GetUserReply reply; users.GetUser(request, reply);
 }
 ]=])
@@ -32,7 +36,7 @@ void invoke() { rpc::mapped_protobuf_codec_policy::operations<Invalid>(); }
 ]=])
 set(wrong_request [=[
 void invoke(rpc::client &c) {
-    example::UserStub users{c, example::users_contract(rpc::mapped_protobuf_codec_policy{})};
+    example::UserStub<rpc::mapped_protobuf_codec_policy> users{c, example::users_contract(rpc::mapped_protobuf_codec_policy{})};
     example::wire::GetUserRequest request; example::GetUserReply reply; users.GetUser(request, reply);
 }
 ]=])

@@ -1,3 +1,0 @@
-syntax = "proto3";
-package lrpc_bench;
-message Payload { bytes payload = 1; }

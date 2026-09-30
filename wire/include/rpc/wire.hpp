@@ -89,7 +89,7 @@ struct frame_header {
 struct limits {
     std::uint32_t max_frame_size = 4U * 1024U * 1024U;
     std::uint32_t max_message_size = 64U * 1024U * 1024U;
-    std::uint32_t features = 0; // Negotiated profile; zero retains the v1 unary grammar.
+    std::uint32_t features = 0; // Negotiated profile; zero retains the original unary grammar.
 };
 
 struct frame_view {

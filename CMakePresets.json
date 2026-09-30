@@ -26,12 +26,11 @@
         "LRPC_BUILD_EXAMPLES": false}
     },
     {"name": "bench-alloc", "inherits": "bench", "cacheVariables": {"LRPC_BENCH_COUNT_ALLOCATIONS": true}},
-    {"name": "bench-queue", "inherits": "bench", "cacheVariables": {"LRPC_ENABLE_DIAGNOSTICS": true}},
     {"name": "diagnose", "inherits": "bench-alloc", "cacheVariables": {
-      "LRPC_ENABLE_DIAGNOSTICS": true, "CMAKE_CXX_FLAGS": "-g -fno-omit-frame-pointer"}},
+      "CMAKE_CXX_FLAGS": "-g -fno-omit-frame-pointer"}},
     {"name": "tsan", "inherits": "debug", "cacheVariables": {
       "CMAKE_CXX_COMPILER": "clang++", "CMAKE_CXX_FLAGS": "-fsanitize=thread -fno-omit-frame-pointer",
-      "CMAKE_EXE_LINKER_FLAGS": "-fsanitize=thread", "LRPC_BUILD_ALLOCATION_FAILURE_TESTS": false}},
+      "CMAKE_EXE_LINKER_FLAGS": "-fsanitize=thread", "LRPC_BUILD_ALLOCATION_TESTS": false}},
     {
       "name": "sanitize",
       "inherits": "debug",
@@ -41,7 +40,8 @@
     {
       "name": "fuzz",
       "inherits": "sanitize",
-      "cacheVariables": {"LRPC_BUILD_FUZZER": true, "LRPC_BUILD_NET_SMOKE": false, "LRPC_BUILD_UNARY": false}
+      "cacheVariables": {"LRPC_BUILD_FUZZER": true, "LRPC_BUILD_TESTS": false, "LRPC_BUILD_EXAMPLES": false,
+        "LRPC_BUILD_RPC": false}
     }
   ],
   "buildPresets": [
@@ -55,7 +55,6 @@
     {"name": "json-sanitize", "configurePreset": "json-sanitize"},
     {"name": "bench", "configurePreset": "bench"},
     {"name": "bench-alloc", "configurePreset": "bench-alloc"},
-    {"name": "bench-queue", "configurePreset": "bench-queue"},
     {"name": "diagnose", "configurePreset": "diagnose"},
     {"name": "tsan", "configurePreset": "tsan"},
     {"name": "sanitize", "configurePreset": "sanitize"},

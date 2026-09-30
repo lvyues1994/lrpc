@@ -359,7 +359,7 @@ struct json_codec_policy {
         static codec_ops const value{
             [](void const *p) { return json_codec<Message>::size(*static_cast<Message const *>(p)); },
             [](void const *p, wire::mutable_bytes_view out) { return json_codec<Message>::encode(*static_cast<Message const *>(p), out); },
-            [](wire::bytes_view in, void *p) { return json_codec<Message>::decode(in, *static_cast<Message *>(p)); }, nullptr,
+            [](wire::bytes_view in, void *p) { return json_codec<Message>::decode(in, *static_cast<Message *>(p)); },
             [](void const *p, wire::mutable_bytes_view out) { return json_codec<Message>::encode_bounded(*static_cast<Message const *>(p), out); },
             [](void const *p) { return json_codec<Message>::upper_bound(*static_cast<Message const *>(p)); }};
         static_cast<void>(json_detail::operations<Message>());

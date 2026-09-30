@@ -28,12 +28,13 @@ with tempfile.TemporaryDirectory(prefix="lrpc-codegen-") as directory:
     assert first == second and len(first) == 12
     assert b"delete_(" in first[pathlib.Path("echo.rpc.hpp")]
     assert b"::test::messages::Container_Item" in first[pathlib.Path("echo.rpc.hpp")]
-    assert b"add_Echo_service" in first[pathlib.Path("echo.rpc.hpp")]
-    assert b"channel.bind(::demo::Echo_service_descriptor())" in first[pathlib.Path("echo.rpc.cpp")]
-    for kind in (b"unary", b"client_streaming", b"server_streaming", b"bidirectional"):
+    assert b"Echo_bindings(EchoService &service" in first[pathlib.Path("echo.rpc.hpp")]
+    assert b"::rpc::encoded<::demo::EchoRequest>(request)" in first[pathlib.Path("echo.rpc.cpp")]
+    for kind in (b"client_streaming", b"server_streaming", b"bidirectional"):
         assert b"::rpc::method_kind::" + kind in first[pathlib.Path("echo.rpc.cpp")]
-    assert b"::rpc::bind_stream_method" in first[pathlib.Path("echo.rpc.cpp")]
-    assert b"::rpc::open_stream<" in first[pathlib.Path("echo.rpc.cpp")]
+    assert b"::rpc::bind_method(" in first[pathlib.Path("echo.rpc.cpp")]
+    assert b"::rpc::bind_stream_method(" in first[pathlib.Path("echo.rpc.cpp")]
+    assert b"::rpc::typed_open_operation<" in first[pathlib.Path("echo.rpc.cpp")]
 
     cases = [
         ('message M{} service S {rpc delete(M) returns(M); rpc delete_(stream M) returns(stream M);}', "collision"),
@@ -41,8 +42,9 @@ with tempfile.TemporaryDirectory(prefix="lrpc-codegen-") as directory:
         ('message EchoService{} service Echo{}', "collision"),
         ('message Outer {message EchoService{}} service Outer_Echo{}', "collision"),
         ('enum E {EchoService=0;} service Echo{}', "collision"),
-        ('enum Echo_service {ZERO=0;} service Echo{}', "collision"),
-        ('message add_Echo_service{} service Echo{}', "collision"),
+        ('message EchoLimits{} service Echo{}', "collision"),
+        ('message Echo_bindings{} service Echo{}', "collision"),
+        ('message M{} service S{rpc lrpc_target_(M) returns(M);}', "collision"),
         ('message M{} service S{rpc lrpc_methods_(M) returns(M);}', "collision"),
         ('option cc_generic_services=true; service Echo{}', "cc_generic_services"),
     ]

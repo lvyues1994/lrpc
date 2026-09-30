@@ -1,25 +1,17 @@
 #pragma once
 
 #include "event.hpp"
-#include <rpc/unary.hpp>
-#include "../unary/src/diagnostics.hpp"
+#include <rpc/client.hpp>
 
 #include <array>
 #include <cstdint>
 #include <string>
 #include <vector>
-#ifdef LRPC_BENCH_PROTOBUF
-#include "bench.pb.h"
-#endif
 
 namespace bench {
 
 struct options {
     std::string transport = "rpc";
-    std::string codec = "bytes";
-    std::string rpc_entry = "client";
-    unsigned runtime_cpu0 = 4, runtime_cpu1 = 6;
-    std::size_t arena_cache = 0;
     net::backend_kind backend = net::backend_kind::epoll;
     std::size_t bytes = 64;
     std::size_t inflight = 1;
@@ -55,23 +47,17 @@ struct slot {
     bool busy = false;
     bool sent = false;
     bool received = false;
-#ifdef LRPC_BENCH_PROTOBUF
-    lrpc_bench::Payload proto_request{};
-    lrpc_bench::Payload proto_reply{};
-#endif
 };
 
 struct channel {
     virtual ~channel() = default;
     virtual net::task<rpc::status_code> connect() = 0;
     virtual net::task<rpc::call_result> call(slot &storage) = 0;
-    virtual void prepare(slot &) {}
     virtual bool validate(slot const &storage, rpc::call_result const &result) const {
-        return result.response_size == storage.request.size() && storage.request == storage.reply;
+        return result.size == storage.request.size() && storage.request == storage.reply;
     }
     virtual void begin_measurement() noexcept = 0;
     virtual void close() noexcept = 0;
-    virtual void join() {}
 };
 
 std::unique_ptr<channel> make_channel(net::io_context &context, options const &config);
@@ -96,7 +82,6 @@ struct measurements {
     cpu_times cpu{};
     std::uint64_t new_calls = 0;
     std::size_t maximum_inflight = 0;
-    rpc::detail::queue_metrics queues{};
 };
 
 measurements run(options const &config);

@@ -1,189 +1,291 @@
-#include "client_fixture.hpp"
+#include "backend.hpp"
+#include "check.hpp"
+
+#include <rpc/service.hpp>
 #include <rpc/typed.hpp>
+
+#include <net/run_async.hpp>
 #include <net/timeout.hpp>
 
+#include <array>
+#include <chrono>
+#include <cstring>
 #include <iostream>
-#include <functional>
-#include <thread>
+#include <string>
+#include <vector>
 
-static std::function<void()> decode_hook;
+// Four little-endian bytes; a flag makes encode or decode refuse.
+struct number {
+    std::uint32_t value = 0;
+    bool refuse = false;
+};
 
-struct byte_message {
-    std::uint8_t value = 42;
-    rpc::client *channel = nullptr;
-    unsigned close_at = 0; // size, encode or decode.
-    bool allocation_failure = false;
+// Text encoded in one pass into an upper bound, as the JSON codec does.
+struct text_message {
+    std::string text;
 };
 
 namespace rpc {
-template <> struct codec<byte_message> {
-    static std::size_t size(byte_message const &value) {
-        if (value.close_at == 1) value.channel->close();
-        if (value.allocation_failure) throw std::bad_alloc{};
-        return 1;
+template <> struct codec<number> {
+    static std::size_t size(number const &) { return 4; }
+    static bool encode(number const &message, wire::mutable_bytes_view out) {
+        if (message.refuse || out.size != 4) return false;
+        std::memcpy(out.data, &message.value, 4);
+        return true;
     }
-    static bool encode(byte_message const &value, wire::mutable_bytes_view out) {
-        if (value.close_at == 2) value.channel->close();
-        if (out.size != 1) return false;
-        out.data[0] = value.value; return true;
-    }
-    static bool decode(wire::bytes_view in, byte_message &value) {
-        if (decode_hook) decode_hook();
-        if (value.close_at == 3) value.channel->close();
-        if (in.size != 1) return false;
-        value.value = in.data[0]; return true;
+    static bool decode(wire::bytes_view in, number &message) {
+        if (message.refuse || in.size != 4) return false;
+        std::memcpy(&message.value, in.data, 4);
+        return true;
     }
 };
 } // namespace rpc
 
 namespace {
-void client_codec(unsigned close_at, bool allocation_failure = false) {
-    test_client::fixture f; byte_message request, response;
-    request.channel = response.channel = f.client.get(); request.close_at = response.close_at = close_at;
-    request.allocation_failure = allocation_failure;
-    unsigned completed = 0; rpc::call_result result; std::exception_ptr error;
-    net::run_async(f.context.get_executor(), [&](rpc::call_result value) { result = value; ++completed; },
-        [&](std::exception_ptr value) { error = value; })([&] {
-        return rpc::call(*f.client, rpc::method<byte_message, byte_message>{"Echo"}, request, response);
-    });
-    f.context.poll();
-    if (close_at == 0 && !allocation_failure) {
-        auto frame = rpc::wire::decode_frame({f.pipe->output.data(), f.pipe->output.size()});
-        CHECK(frame.code == rpc::wire::error::none && frame.value.body.size == 1 && frame.value.body.data[0] == 42);
-    }
-    if (!completed) { f.pipe->feed(test_client::reply(1, 73)); f.context.poll(); }
-    if (error) std::rethrow_exception(error);
-    CHECK(completed == 1);
-    if (allocation_failure) CHECK(result.code == rpc::status_code::resource_exhausted);
-    else if (close_at == 1 || close_at == 2) CHECK(result.code == rpc::status_code::unavailable);
-    else CHECK(result.code == rpc::status_code::ok && response.value == 73 && result.response_size == 1);
-    f.zero(); CHECK(completed == 1);
+
+using rpc::wire::bytes_view;
+using std::chrono::milliseconds;
+
+net::backend_kind selected_backend = net::default_backend_t::kind;
+
+struct bounded_policy {
+    template <class Message> static rpc::codec_ops const &operations();
+};
+template <> rpc::codec_ops const &bounded_policy::operations<text_message>() {
+    static rpc::codec_ops const ops{
+        [](void const *) -> std::size_t { throw std::logic_error{"size is not used by one-pass codecs"}; },
+        [](void const *, rpc::wire::mutable_bytes_view) -> bool { throw std::logic_error{"exact encode is not used"}; },
+        [](rpc::wire::bytes_view in, void *message) {
+            static_cast<text_message *>(message)->text.assign(reinterpret_cast<char const *>(in.data), in.size);
+            return true;
+        },
+        [](void const *message, rpc::wire::mutable_bytes_view out) -> rpc::wire::encode_result {
+            auto const &text = static_cast<text_message const *>(message)->text;
+            if (text.size() > out.size) return {rpc::wire::error::output_too_small, 0};
+            std::memcpy(out.data, text.data(), text.size());
+            return {rpc::wire::error::none, text.size()};
+        },
+        [](void const *message) { return static_cast<text_message const *>(message)->text.size() + 16; }};
+    return ops;
 }
+
+rpc::method<number, number> const doubler{"typed/Double"};
+rpc::method<text_message, text_message, bounded_policy> const shout{"typed/Shout"};
+rpc::method<number, number> const counter{"typed/Count"};
+
+auto double_it(rpc::server_context &context, number const &request, number &response)
+    CO2_BEG(net::task<rpc::status_code>, (context, request, response)) {
+    if (request.value == 13) {
+        CHECK(context.set_trailer({reinterpret_cast<std::uint8_t const *>("unlucky"), 7}));
+        CO2_RETURN(rpc::status_code::failed_precondition);
+    }
+    response.value = request.value * 2;
+    response.refuse = request.value == 99; // Encoding the reply fails.
+    CO2_RETURN(rpc::status_code::ok);
+}
+CO2_END
+
+auto shout_it(text_message const &request, text_message &response)
+    CO2_BEG(net::task<rpc::status_code>, (request, response)) {
+    response.text = request.text + "!";
+    CO2_RETURN(rpc::status_code::ok);
+}
+CO2_END
+
+using count_stream = rpc::typed_server_stream<number, number, rpc::default_codec_policy>;
+auto count_up(count_stream &stream)
+    CO2_BEG(net::task<rpc::status_code>, (stream), number message; rpc::stream_read read; rpc::status_code wrote;) {
+    for (;;) {
+        CO2_AWAIT_SET(read, stream.read(message));
+        if (read.code != rpc::status_code::ok) CO2_RETURN(read.code);
+        if (read.ended) break;
+        ++message.value;
+        CO2_AWAIT_SET(wrote, stream.write(message));
+        if (wrote != rpc::status_code::ok) CO2_RETURN(wrote);
+    }
+    CO2_RETURN(rpc::status_code::ok);
+}
+CO2_END
 
 struct service {
-    bool entered = false;
-    net::task<rpc::status_code> echo(rpc::server_context &, byte_message const &, byte_message &);
+    net::task<rpc::status_code> Double(rpc::server_context &context, number const &request, number &response) {
+        return double_it(context, request, response);
+    }
+    net::task<rpc::status_code> Shout(rpc::server_context &, text_message const &request, text_message &response) {
+        return shout_it(request, response);
+    }
+    net::task<rpc::status_code> Count(rpc::server_context &, count_stream &stream) { return count_up(stream); }
 };
-auto echo_task(byte_message const *request, byte_message *response)
-    CO2_BEG(net::task<rpc::status_code>, (request, response)) {
-    CO2_AWAIT(net::delay(std::chrono::milliseconds{1}));
-    response->value = static_cast<std::uint8_t>(request->value + 1); CO2_RETURN(rpc::status_code::ok);
+
+std::vector<rpc::method_binding> bindings(service &implementation) {
+    rpc::method_limits small{};
+    small.max_response_bytes = 4;
+    return {rpc::bind_method(doubler, implementation, &service::Double, small),
+            rpc::bind_method(shout, implementation, &service::Shout),
+            rpc::bind_stream_method(counter, rpc::method_kind::bidirectional, implementation, &service::Count)};
+}
+
+struct fixture {
+    fixture()
+        : shard(context), server(shard, bindings(implementation)), client(shard),
+          endpoint(server.listen({net::ip::address_v4::loopback(), 0})), call(client, doubler) {}
+    template <class F> void run(F factory) {
+        std::exception_ptr failure;
+        auto close = [&] {
+            client.close();
+            server.close();
+        };
+        net::run_async(context.get_executor(), close, [&](std::exception_ptr error) {
+            failure = error;
+            close();
+        })(factory);
+        context.run();
+        if (failure) std::rethrow_exception(failure);
+        CHECK(server.stats().active_calls == 0 && server.stats().response_bytes == 0);
+    }
+    net::io_context context{selected_backend, net::single_thread_hint};
+    rpc::shard shard;
+    service implementation;
+    rpc::server server;
+    rpc::client client;
+    net::ip::tcp::endpoint endpoint;
+    rpc::bound_method<number, number> call;
+};
+
+auto unary(fixture &f)
+    CO2_BEG(net::task<>, (f), rpc::status_code connected; rpc::call_result result; number request; number response;
+            text_message text; text_message loud; rpc::response_trailer trailer; std::array<std::uint8_t, 64> storage{};) {
+    CO2_AWAIT_SET(connected, f.client.connect(f.endpoint));
+    CHECK(connected == rpc::status_code::ok);
+    request.value = 21;
+    CO2_AWAIT_SET(result, f.call(request, response));
+    CHECK(result.code == rpc::status_code::ok && response.value == 42 && result.size == 4);
+
+    request.refuse = true; // The client cannot encode: nothing is sent.
+    CO2_AWAIT_SET(result, f.call(request, response));
+    CHECK(result.code == rpc::status_code::invalid_argument && result.not_executed);
+    request.refuse = false;
+
+    request.value = 13; // The handler explains its error through the context.
+    trailer.storage = {storage.data(), storage.size()};
+    CO2_AWAIT_SET(result, f.call(request, response, nullptr, &trailer));
+    CHECK(result.code == rpc::status_code::failed_precondition && trailer.message.size == 7);
+
+    request.value = 99; // The server cannot encode its reply.
+    CO2_AWAIT_SET(result, f.call(request, response));
+    CHECK(result.code == rpc::status_code::internal);
+
+    request.value = 1;
+    response.refuse = true; // The client cannot decode the reply.
+    CO2_AWAIT_SET(result, f.call(request, response));
+    CHECK(result.code == rpc::status_code::internal);
+    response.refuse = false;
+
+    // A request the server cannot decode: send raw bytes of the wrong size.
+    CO2_AWAIT_SET(result, f.client.call(f.client.bind(doubler.name), {storage.data(), 3}, {storage.data(), 4}));
+    CHECK(result.code == rpc::status_code::invalid_argument);
+
+    text.text = "hello";
+    CO2_AWAIT_SET(result, rpc::bind(f.client, shout)(text, loud));
+    CHECK(result.code == rpc::status_code::ok && loud.text == "hello!");
+    CO2_RETURN();
 }
 CO2_END
-net::task<rpc::status_code> service::echo(rpc::server_context &, byte_message const &request, byte_message &response) {
-    entered = true;
-    return echo_task(&request, &response);
-}
 
-void typed_adapter(rpc::status_code expected = rpc::status_code::ok) {
-    service impl;
-    auto binding = rpc::bind_method<byte_message, byte_message, service, rpc::status_code>(rpc::method<byte_message, byte_message>{"custom/Echo"}, impl, &service::echo, {1, 2});
-    auto copy = binding; binding = {};
-    CHECK(copy.handler == copy.owned_handler.get());
-    net::io_context context{net::default_backend, net::single_thread_hint};
-    rpc::server_context call; std::uint8_t input = 41, output = 0;
-    net::stop_source stop;
-    call.stop_token = stop.get_token();
-    if (expected == rpc::status_code::cancelled) decode_hook = [&] { stop.request_stop(); };
-    if (expected == rpc::status_code::deadline_exceeded) {
-        call.deadline = rpc::clock::now() + std::chrono::milliseconds{1};
-        decode_hook = [&] { std::this_thread::sleep_until(call.deadline); };
+auto streaming(fixture &f)
+    CO2_BEG(net::task<>, (f), rpc::status_code connected; rpc::typed_open_result<number, number, rpc::default_codec_policy> opened;
+            rpc::status_code wrote; rpc::stream_read read; rpc::call_result result; number message; unsigned i = 0;) {
+    CO2_AWAIT_SET(connected, f.client.connect(f.endpoint));
+    CHECK(connected == rpc::status_code::ok);
+    CO2_AWAIT_SET(opened, (rpc::bound_stream<number, number>{f.client, counter, rpc::method_kind::bidirectional}()));
+    CHECK(opened.code == rpc::status_code::ok && opened.stream);
+    for (i = 0; i < 5; ++i) {
+        message.value = i * 10;
+        CO2_AWAIT_SET(wrote, opened.stream.write(message));
+        CHECK(wrote == rpc::status_code::ok);
+        CO2_AWAIT_SET(read, opened.stream.read(message));
+        CHECK(read.code == rpc::status_code::ok && message.value == i * 10 + 1);
     }
-    rpc::response_writer writer{{&output, 1}}; bool completed = false; std::exception_ptr error;
-    net::run_async(context.get_executor(), [&](rpc::status_code code) {
-        CHECK(code == expected); completed = true;
-    }, [&](std::exception_ptr value) { error = value; })([&] { return copy.handler->invoke(call, {&input, 1}, writer); });
-    context.run(); decode_hook = {}; if (error) std::rethrow_exception(error);
-    CHECK(completed);
-    if (expected == rpc::status_code::ok) CHECK(impl.entered && output == 42 && writer.size() == 1);
-    else CHECK(!impl.entered && output == 0 && writer.size() == 0);
-}
-
-void bound_methods() {
-    rpc::client_options options{}; options.max_registered_methods = 2;
-    test_client::fixture f{options}, other;
-    auto const *ops = &rpc::codec_for<byte_message>();
-    rpc::method_descriptor descriptor{"Echo", rpc::method_kind::unary, rpc::idempotency::unknown, ops, ops};
-    auto echo = f.client->bind(descriptor);
-    CHECK(echo && f.client->bind(descriptor));
-    rpc::codec_ops different = *ops;
-    auto conflict = descriptor; conflict.request_codec = &different;
-    rpc::method_descriptor batch[] = {{"New", rpc::method_kind::unary, rpc::idempotency::unknown, ops, ops}, conflict};
-    bool rejected = false;
-    try { f.client->bind({"S", batch, 2}); } catch (std::invalid_argument const &) { rejected = true; }
-    CHECK(rejected);
-    auto another = descriptor; another.name = "Another";
-    CHECK(f.client->bind(another)); // Failed batch did not consume its slot.
-    auto foreign = other.client->bind(descriptor);
-    byte_message request, response; rpc::call_result result; unsigned completed = 0;
-    auto start = [&](rpc::method_handle handle, bool string_call = false) {
-        net::run_async(f.context.get_executor(), [&](rpc::call_result value) { result = std::move(value); ++completed; },
-            [](std::exception_ptr error) { std::rethrow_exception(error); })([&] {
-            return string_call ? rpc::call(*f.client, rpc::method<byte_message, byte_message>{"Echo"}, request, response)
-                               : rpc::call(*f.client, handle, request, response);
-        });
-        f.context.poll();
-    };
-    start(echo); f.pipe->feed(test_client::reply(1, 73)); f.context.poll();
-    CHECK(completed == 1 && result.code == rpc::status_code::ok && response.value == 73);
-    f.pipe->output.clear(); start(echo, true);
-    auto frame = rpc::wire::decode_frame({f.pipe->output.data(), f.pipe->output.size()});
-    CHECK(frame.code == rpc::wire::error::none && !(frame.value.header.flags & rpc::wire::new_method));
-    CHECK(frame.value.header.aux == 1);
-    f.pipe->feed(test_client::reply(2)); f.context.poll();
-    start(echo); f.pipe->feed(test_client::reply(3)); f.context.poll();
-    CHECK(completed == 3 && result.code == rpc::status_code::ok);
-    start(foreign); CHECK(completed == 4 && result.code == rpc::status_code::invalid_argument);
-    start({}); CHECK(completed == 5 && result.code == rpc::status_code::invalid_argument);
-    f.zero(); other.zero();
-}
-
-struct status_service {
-    rpc::status result{rpc::status_code::permission_denied, "denied after suspension"};
-    net::task<rpc::status> echo(rpc::server_context &, byte_message const &, byte_message &);
-};
-auto status_reply(status_service *self, byte_message const *request, byte_message *response)
-    CO2_BEG(net::task<rpc::status>, (self, request, response)) {
-    CO2_AWAIT(net::delay(std::chrono::milliseconds{1}));
-    response->value = request->value;
-    CO2_RETURN(self->result);
+    message.refuse = true;
+    CO2_AWAIT_SET(wrote, opened.stream.write(message));
+    CHECK(wrote == rpc::status_code::invalid_argument); // Refused before anything was queued.
+    CO2_AWAIT_SET(wrote, opened.stream.writes_done());
+    CO2_AWAIT_SET(read, opened.stream.read(message));
+    CHECK(read.ended);
+    CO2_AWAIT_SET(result, opened.stream.finish());
+    CHECK(result.code == rpc::status_code::ok);
+    CO2_RETURN();
 }
 CO2_END
-net::task<rpc::status> status_service::echo(rpc::server_context &, byte_message const &req, byte_message &resp) {
-    return status_reply(this, &req, &resp);
+
+using users = rpc::service_contract<rpc::default_codec_policy, rpc::unary_method<number, number>>;
+
+auto contract(fixture &f, users const *numbers)
+    CO2_BEG(net::task<>, (f, numbers), rpc::status_code connected; rpc::call_result result; number request; number response;) {
+    CO2_AWAIT_SET(connected, f.client.connect(f.endpoint));
+    CHECK(connected == rpc::status_code::ok);
+    request.value = 5;
+    CO2_AWAIT_SET(result, rpc::bind_service(f.client, *numbers).call<0>(request, response));
+    CHECK(result.code == rpc::status_code::ok && response.value == 10);
+    CO2_RETURN();
 }
-void owning_status() {
-    net::io_context context{net::default_backend, net::single_thread_hint};
-    status_service impl;
-    auto binding = rpc::bind_method(rpc::method<byte_message, byte_message>{"Status"}, impl, &status_service::echo, {1, 64});
-    std::uint8_t input = 42, output = 0; std::array<std::uint8_t, 64> head{};
-    for (auto code : {rpc::status_code::permission_denied, rpc::status_code::ok}) {
-        impl.result = {code, code == rpc::status_code::ok ? "" : "denied after suspension"};
-        rpc::server_context call; call.response_metadata = rpc::metadata_writer{{head.data(), head.size()}};
-        rpc::response_writer writer{{&output, 1}}; bool completed = false;
-        net::run_async(context.get_executor(), [&](rpc::status_code value) { CHECK(value == code); completed = true; },
-            [](std::exception_ptr error) { std::rethrow_exception(error); })
-            ([&] { return binding.handler->invoke(call, {&input, 1}, writer); });
-        context.run(); CHECK(completed);
-        auto decoded = rpc::wire::decode_end_head({head.data(), call.response_metadata.size()});
-        CHECK(decoded.code == rpc::wire::error::none && decoded.value.message.size == impl.result.message.size());
-        CHECK(writer.size() == (code == rpc::status_code::ok ? 1U : 0U));
+CO2_END
+
+auto through_channel(rpc::channel &channel)
+    CO2_BEG(net::task<>, (channel), rpc::status_code ready; rpc::call_result result; number request; number response;) {
+    CO2_AWAIT_SET(ready, channel.wait_ready(std::chrono::steady_clock::now() + std::chrono::seconds{5}));
+    CHECK(ready == rpc::status_code::ok);
+    request.value = 8;
+    CO2_AWAIT_SET(result, rpc::bind(channel, doubler)(request, response));
+    CHECK(result.code == rpc::status_code::ok && response.value == 16);
+    channel.close();
+    CO2_RETURN();
+}
+CO2_END
+
+template <class Function> void rejects(Function function) {
+    bool failed = false;
+    try {
+        function();
+    } catch (std::invalid_argument const &) {
+        failed = true;
     }
-    rpc::server_builder builder{context}; builder.add(std::vector<rpc::method_binding>{binding});
-    auto server = builder.build(); CHECK(server->stats().active_calls == 0 && context.run() == 0);
-    bool rejected = false;
-    try { builder.build(); } catch (std::logic_error const &) { rejected = true; }
-    CHECK(rejected); server->close(); context.run();
+    CHECK(failed);
 }
+
 } // namespace
 
-int main() {
+int main(int argc, char **argv) {
     try {
-        for (unsigned at = 0; at < 4; ++at) client_codec(at);
-        client_codec(0, true); typed_adapter();
-        typed_adapter(rpc::status_code::cancelled);
-        typed_adapter(rpc::status_code::deadline_exceeded);
-        bound_methods(); owning_status();
-        std::cout << "PASS generic codec, owned adapter, reentrant close and allocation failure\n";
-    } catch (std::exception const &error) { std::cerr << error.what() << '\n'; return 1; }
+        selected_backend = test_backend(argc, argv);
+        if (!net::backend_available(selected_backend)) {
+            std::cout << "SKIP backend unavailable\n";
+            return 77;
+        }
+        { fixture f; f.run([&] { return unary(f); }); std::cout << "PASS typed unary, codec failures, trailer\n"; }
+        { fixture f; f.run([&] { return streaming(f); }); std::cout << "PASS typed bidirectional stream\n"; }
+        {
+            using method = rpc::unary_method<number, number>;
+            rejects([] { rpc::make_service_contract("", rpc::default_codec_policy{}, method{"a"}); });
+            rejects([] { rpc::make_service_contract("s", rpc::default_codec_policy{}, method{"a"}, method{"a"}); });
+            rejects([] { rpc::make_service_contract("s", rpc::default_codec_policy{}, method{std::string{"a\0b", 3}}); });
+            auto const numbers = rpc::make_service_contract("numbers", rpc::default_codec_policy{}, method{"typed/Double"});
+            fixture f;
+            f.run([&] { return contract(f, &numbers); });
+            service other;
+            CHECK(numbers.bindings(other, {{}}, &service::Double).size() == 1);
+            using function = net::task<rpc::status_code> (service::*)(rpc::server_context &, number const &, number &);
+            rejects([&] { numbers.bindings(other, {{}}, function{}); });
+            std::cout << "PASS service contract\n";
+        }
+        {
+            fixture f;
+            rpc::channel channel{f.shard, {f.endpoint}};
+            f.run([&] { return through_channel(channel); });
+            std::cout << "PASS typed calls through a channel\n";
+        }
+    } catch (std::exception const &error) {
+        std::cerr << error.what() << '\n';
+        return 1;
+    }
 }

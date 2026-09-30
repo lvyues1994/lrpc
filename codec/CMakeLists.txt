@@ -1,5 +1,0 @@
-add_library(rpc_codec INTERFACE)
-add_library(lrpc::codec ALIAS rpc_codec)
-target_include_directories(rpc_codec INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}/include")
-target_link_libraries(rpc_codec INTERFACE lrpc::wire)
-target_compile_features(rpc_codec INTERFACE cxx_std_14)

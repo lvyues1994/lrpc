@@ -1,5 +1,5 @@
 add_executable(unary_echo unary_echo.cpp)
-target_link_libraries(unary_echo PRIVATE lrpc::unary)
+target_link_libraries(unary_echo PRIVATE lrpc::rpc)
 lrpc_configure_target(unary_echo)
 if(LRPC_BUILD_TESTS)
     add_test(NAME unary_echo COMMAND unary_echo)

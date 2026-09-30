@@ -26,8 +26,8 @@ ctest --preset json
 ```
 
 也接受父项目的 `RapidJSON`/`rapidjson` target，或 `find_package(RapidJSON CONFIG)` 安装包。
-配置不会下载依赖；JSON 的公开头文件不包含 RapidJSON 类型。使用方链接 `lrpc::json`，
-需要 channel/runtime 时同时链接 `lrpc::runtime`。保留 C++14；无须 protoc 或 JSON 代码生成器。
+配置不会下载依赖；JSON 的公开头文件不包含 RapidJSON 类型。使用方链接 `lrpc::json`。
+保留 C++14；无须 protoc 或 JSON 代码生成器。
 
 ## 结构体映射与服务契约
 
@@ -39,8 +39,7 @@ struct GetUserReply { std::string name; };
 RPC_JSON_FIELDS(GetUserRequest, id);
 RPC_JSON_FIELDS(GetUserReply, name);
 
-rpc::json_method<GetUserRequest, GetUserReply> const get_user{
-    "users/GetUser", rpc::idempotency::no_side_effects};
+rpc::json_method<GetUserRequest, GetUserReply> const get_user{"users/GetUser"};
 ```
 
 宏放在全局命名空间，支持 1–16 个字段；映射不侵入结构体，也不改变该类型的其它 codec。
@@ -70,56 +69,36 @@ struct UserService {
         GetUserRequest const &, GetUserReply &);
 };
 
-rpc::server_builder builder{context};
-builder.add(get_user, service, &UserService::GetUser, {1024, 128});
-auto server = builder.build();
+std::vector<rpc::method_binding> methods;
+methods.push_back(rpc::bind_method(get_user, service, &UserService::GetUser, {1024, 128}));
+rpc::server server{shard, std::move(methods)};
 ```
 
-`{1024, 128}` 分别是该方法的响应 body 与响应 head 上限；服务对象须保活到业务排空。
-注册时检查 handler 签名，避免将错误的请求或响应类型绑定到方法。
+`{1024, 128}` 分别是该方法的回复编码上限与 END head（状态说明和 metadata）上限，省略时为 64 KiB 和 256 B；
+服务对象须保活到服务端排空。handler 签名在编译期检查，错误的请求或响应类型不能绑定到方法。
 
-客户端服务 stub 在构造时冷绑定，命名函数直接返回底层 task：
+客户端绑定一次，之后每次调用返回 `rpc::unary_call`：
 
 ```cpp
-class UserStub {
-public:
-    explicit UserStub(rpc::client &client) : get_(rpc::bind(client, get_user)) {}
-    net::task<rpc::call_result> GetUser(GetUserRequest const &request,
-        GetUserReply &reply, rpc::call_options options = {}) const {
-        return get_(request, reply, options);
-    }
-private:
-    rpc::json_bound_method<GetUserRequest, GetUserReply> get_;
-};
-
-// 在调用协程内，先等待 connect() 或 channel.warmup() 成功：
-UserStub users{*client};
+auto const get = rpc::bind(client, get_user); // 或 rpc::bind(channel, get_user)
+// 在调用协程内，先等待 connect() 或 channel.wait_ready() 成功：
 GetUserRequest request{7};
 GetUserReply reply;
-CO2_AWAIT_SET(result, users.GetUser(request, reply));
+CO2_AWAIT_SET(result, get(request, reply, &spec, &trailer));
 ```
 
-错误的参数类型在编译时拒绝。bound_method 只能由 `rpc::bind` 创建，不能把任意擦除 handle
-重新标注为其它消息类型。stub 借用 client，调用完成前请求、响应及 metadata 均须保活。
-多方法服务可使用 `service_contract` 一次批量绑定，server 与 stub 共用类型/名字定义。
-[完整示例](../examples/json_users.cpp) 注册并调用 GetUser、RenameUser，
-共享结构体和 stub 见 [users.hpp](../examples/users.hpp)。初始化选 JSON/protobuf、普通结构体的显式
-protobuf 映射及原子注册见 [共享服务契约](service-contract.md)。
-
-单分片 client/channel 也可使用 `rpc::call(client, get_user, request, reply, options)`。
-带幂等性声明的方法会冷绑定并消费该声明；默认 unknown 保留字符串入口。
-声明本身不启用重试，仍须显式配置 `options.retry`。普通 method 与旧 bind_method 显式模板调用保持源码兼容。
-runtime facade 只允许启动前绑定：先构造 bound_method/stub，再 start()，运行期间通过它调用。
-带幂等性声明的上述 convenience call 会再次尝试 bind，因而不适用于已经启动的 runtime facade。
-JSON 也使用现有双向 metadata API，示例包含 trace-id 往返。
+错误的参数类型在编译时拒绝；`json_bound_method` 只能由 `rpc::bind` 创建，不能把任意 `method_ref`
+重新标注为其它消息类型。bound_method 借用 client/channel，调用完成前请求、回复、`spec` 和 trailer 均须保活。
+多方法服务可使用 `service_contract` 一次绑定，server 与 stub 共用类型和名字定义。
+[完整示例](../examples/json_users.cpp) 注册并调用 GetUser、RenameUser，共享结构体和 stub 见 [users.hpp](../examples/users.hpp)；
+初始化时选 JSON 或 protobuf、普通结构体的显式 protobuf 映射见 [共享服务契约](service-contract.md)。
 
 ## 编码、校验与资源
 
-请求直接单次编码到已取得预算的缓冲区，响应同样编码一次并提交实际长度。
-channel 先保存一次编码结果，所有重试复用同一字节快照；等待额度按实际线上大小计费。
-其准备缓冲的物理容量计入 `channel_options.replay_bytes` / `replay_bytes_in_use`，即使没有启用重试。
-扩展 profile 在分配正文前为 MESSAGE 描述符保留预算，并在同步编码后重新检查取消和截止。
-protobuf 和其它只提供 size/encode 的 codec 继续使用原有精确大小路径。
+请求在发送时单次编码进帧，回复同样编码一次并提交实际长度。编码按保守上界预留空间，
+上界超过帧的剩余空间或方法的回复上限时只给剩余部分，实际写不下才失败，所以装得下的消息不会因为转义估算而被拒绝。
+channel 换连接重试时从同一请求消息重新编码，消息须保持不变直到调用完成。
+protobuf 和其它只提供 size/encode 的 codec 使用精确大小路径。
 
 JSON 使用 SAX 直接写入结构体，字符串拥有自己的存储，不保留接收缓冲的借用视图。
 输入必须是完整的一个对象，拒绝尾随数据、原始 NUL、重复字段（含转义后同名字段）、非法 UTF-8、
@@ -141,13 +120,11 @@ JSON 使用 SAX 直接写入结构体，字符串拥有自己的存储，不保�
 逻辑字节累计计入字符串内容、数组元素 sizeof(T) 和未知字段名追踪；不等于进程内存上限，
 不覆盖根结构体、std::string/vector 的多余容量、固定 SAX 帧或分配器开销。
 临时栈有 512 B 内联存储，扩容时计入同时存在的新旧块，超限抛出 bad_alloc。
-请求/响应的线上大小与发送缓冲容量仍分别受 RPC 的 message/frame 和物理预算约束。
-保守上界只遍历字段、长度和容器；最大转义膨胀可使保留容量大于实际字节，当前不会自动缩容或无界增长。
-压缩还需要原有压缩工作区预算，JSON 不绕过该额度。
+请求/回复的线上大小仍受 RPC 的帧和消息上限约束。保守上界只遍历字段、长度和容器，不序列化。
 
 语法、字段类型、数量/深度限制错误的请求返回 invalid_argument；解码逻辑预算、临时栈或分配失败返回 resource_exhausted。
-客户端非法响应返回 data_loss，响应解码分配失败返回 resource_exhausted。
-服务端输出无效 JSON 或超出已声明响应容量返回 internal。
+两种情况下业务函数都不运行。客户端请求编码失败在发送前返回 invalid_argument，超出帧返回 resource_exhausted。
+服务端输出无效 JSON 或超出已声明回复上限返回 internal；客户端解码回复失败（包括内存不足）返回 internal。
 底层 decode 失败可修改目标对象；encode_bounded 失败的 written 为零，但输出缓冲可能已写入部分内容，调用方必须丢弃。
 
 ## 性能验证
@@ -163,6 +140,5 @@ cmake --build --preset json-release
 ./build/json-release/benchmarks/json_codec_bench 100000
 ```
 
-缓冲提前分配，upper_bound 在计时区间外计算；逐次计时包含时钟开销，解码包含目标容器分配与结果比较。
-首轮数据见 [codec 基线](../benchmarks/results/2026-09-30-json-codec.md)，不能替代网络 RPC 的 p99 验收。
-测试覆盖直接连接、channel、显式重试快照、扩展 profile 的跨帧消息、metadata 示例及编译期类型检查。
+缓冲提前分配，upper_bound 在计时区间外计算；逐次计时包含时钟开销，解码包含目标容器分配与结果比较，
+不能替代网络 RPC 的 p99 验收。测试覆盖直接连接、channel、上界超过帧与回复上限、metadata 示例及编译期类型检查。

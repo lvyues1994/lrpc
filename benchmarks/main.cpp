@@ -32,8 +32,6 @@ options parse(int argc, char **argv) {
         if (i + 1 == argc) throw std::invalid_argument{"missing option value: " + key};
         std::string const value = argv[++i];
         if (key == "--transport") { config.transport = value; continue; }
-        if (key == "--codec") { config.codec = value; continue; }
-        if (key == "--rpc-entry") { config.rpc_entry = value; continue; }
         if (key == "--samples") { config.samples = value; continue; }
         if (key == "--allocation-trace") { config.allocation_trace = value; continue; }
         if (key == "--role") { config.role = value; continue; }
@@ -53,9 +51,6 @@ options parse(int argc, char **argv) {
             throw std::invalid_argument{"nonnegative integer required: " + key};
         auto const number = std::stoull(value);
         if (key == "--bytes") config.bytes = static_cast<std::size_t>(number);
-        else if (key == "--runtime-cpu0") config.runtime_cpu0 = static_cast<unsigned>(number);
-        else if (key == "--runtime-cpu1") config.runtime_cpu1 = static_cast<unsigned>(number);
-        else if (key == "--arena-cache") config.arena_cache = static_cast<std::size_t>(number);
         else if (key == "--inflight") config.inflight = static_cast<std::size_t>(number);
         else if (key == "--iterations") config.iterations = static_cast<std::size_t>(number);
         else if (key == "--warmup") config.warmup = static_cast<std::size_t>(number);
@@ -68,12 +63,7 @@ options parse(int argc, char **argv) {
         else if (key == "--port" && number <= 65535) config.port = static_cast<std::uint16_t>(number);
         else throw std::invalid_argument{"unknown option: " + key};
     }
-    if ((config.transport != "net" && config.transport != "rpc" && config.transport != "v2") ||
-        config.arena_cache > 65536 || (config.arena_cache && config.codec != "protobuf") ||
-        (config.rpc_entry != "client" && config.rpc_entry != "channel" && config.rpc_entry != "runtime") ||
-        (config.rpc_entry != "client" && (config.transport != "rpc" || config.role != "both" || config.recycle_frames)) ||
-        (config.codec != "bytes" && config.codec != "protobuf") ||
-        (config.transport != "rpc" && config.codec != "bytes") || (config.bytes != 64 && config.bytes != 4096) ||
+    if ((config.transport != "net" && config.transport != "rpc") || (config.bytes != 64 && config.bytes != 4096) ||
         config.inflight == 0 || config.inflight > 1024 || config.iterations == 0 || config.iterations > 10000000 ||
         config.warmup == 0 || config.warmup > 1000000 || config.burst == 0 || config.burst > 1024 ||
         config.receive_buffer_bytes < 8208 || config.receive_buffer_bytes > 16U * 1024U * 1024U + 16 ||
@@ -88,22 +78,10 @@ options parse(int argc, char **argv) {
     if (config.role == "server" && !config.allocation_trace.empty())
         throw std::invalid_argument{"allocation tracing is recorded by the measurement process only"};
 #ifndef LRPC_BENCH_COUNT_ALLOCATIONS
-    if (!config.allocation_trace.empty()) throw std::invalid_argument{"allocation trace requires bench-alloc or diagnose build"};
-#endif
-#ifndef LRPC_BENCH_PROTOBUF
-    if (config.codec == "protobuf") throw std::invalid_argument{"protobuf benchmark requires LRPC_BUILD_PROTOBUF and LRPC_BUILD_CODEGEN"};
+    if (!config.allocation_trace.empty()) throw std::invalid_argument{"allocation trace requires the bench-alloc build"};
 #endif
     return config;
 }
-
-#ifdef LRPC_ENABLE_DIAGNOSTICS
-void queue_distribution(char const *name, rpc::detail::queue_distribution const &values) {
-    std::cout << '"' << name << "\":{\"count\":" << values.count
-        << ",\"total_ns\":" << values.total_ns << ",\"max_ns\":" << values.maximum_ns << ",\"buckets\":[";
-    for (std::size_t i = 0; i < values.buckets.size(); ++i) { if (i) std::cout << ','; std::cout << values.buckets[i]; }
-    std::cout << "]}";
-}
-#endif
 
 } // namespace
 
@@ -120,12 +98,7 @@ void report(options const &config, measurements const &result) {
 #else
     constexpr bool counting = false;
 #endif
-#ifdef LRPC_ENABLE_DIAGNOSTICS
-    constexpr bool queues = true;
-#else
-    constexpr bool queues = false;
-#endif
-    constexpr bool diagnostic = counting || queues || LRPC_BENCH_SANITIZED;
+    constexpr bool diagnostic = counting || LRPC_BENCH_SANITIZED;
     std::vector<double> success, rejected, timed_out, failed, schedule_lag, total_latency, offer_lag;
     std::array<std::size_t, 17> statuses{};
     std::size_t drops = 0;
@@ -169,14 +142,13 @@ void report(options const &config, measurements const &result) {
         *std::max_element(schedule_lag.begin(), schedule_lag.end()) <= static_cast<double>(config.max_schedule_lag_us) * 1000;
     auto const count = static_cast<double>(config.iterations);
     std::cout << std::fixed << std::setprecision(3)
-        << "{\"transport\":\"" << config.transport << "\",\"codec\":\"" << config.codec
+        << "{\"transport\":\"" << config.transport
         << "\",\"mode\":\"" << (config.rate ? "open" : "closed")
         << "\",\"backend\":\"" << net::to_string(config.backend) << "\",\"build\":\"" << LRPC_BENCH_BUILD_TYPE
         << "\",\"raw_path\":\"" << (config.transport != "net" ? "none" : config.inflight == 1 && config.rate == 0 ? "direct" : "fifo")
-        << "\",\"topology\":\"" << (config.rpc_entry == "runtime" ? "fixed_shard_loopback" : config.role == "client" ? "separate_process_loopback" : "same_thread_loopback")
+        << "\",\"topology\":\"" << (config.role == "client" ? "separate_process_loopback" : "same_thread_loopback")
         << "\",\"cpu_scope\":\"" << (config.role == "client" ? "client_process" : "both_endpoints")
-        << "\",\"rpc_entry\":\"" << config.rpc_entry << "\",\"connections\":" << (config.rpc_entry == "runtime" ? 2 : 1)
-        << ",\"threads\":" << (config.rpc_entry == "runtime" ? 3 : config.role == "client" ? 2 : 1) << ",\"bytes\":" << config.bytes
+        << "\",\"connections\":1,\"threads\":" << (config.role == "client" ? 2 : 1) << ",\"bytes\":" << config.bytes
         << ",\"inflight_limit\":" << config.inflight << ",\"max_inflight\":" << result.maximum_inflight
         << ",\"rpc_streams\":" << config.rpc_streams << ",\"warmup\":" << config.warmup
         << ",\"offered\":" << config.iterations << ",\"started\":" << config.iterations - drops
@@ -185,12 +157,10 @@ void report(options const &config, measurements const &result) {
         << ",\"target_rate\":" << config.rate << ",\"burst\":" << config.burst << ",\"deadline_us\":" << config.deadline_us
         << ",\"receive_buffer_bytes\":" << config.receive_buffer_bytes
         << ",\"frame_allocator\":\"" << (config.recycle_frames ? "recycling" : "system") << '"'
-        << ",\"arena_cache_entries\":" << config.arena_cache
         << ",\"max_schedule_lag_us\":" << config.max_schedule_lag_us
         << ",\"diagnostic_only\":" << (diagnostic ? "true" : "false")
         << ",\"allocation_counting\":" << (counting ? "true" : "false")
         << ",\"allocation_stacks\":" << (!config.allocation_trace.empty() ? "true" : "false")
-        << ",\"queue_instrumentation\":" << (queues ? "true" : "false")
         << ",\"sanitizers\":" << (LRPC_BENCH_SANITIZED ? "true" : "false")
         << ",\"load_faithful\":" << (config.rate == 0 ? "null" : load_faithful ? "true" : "false")
         << ",\"eligible_for_zero_error_p99\":" << (!diagnostic && (config.rate == 0 || load_faithful) && success.size() == config.iterations ? "true" : "false")
@@ -208,20 +178,6 @@ void report(options const &config, measurements const &result) {
         << ",\"new_calls_per_offered\":";
 #ifdef LRPC_BENCH_COUNT_ALLOCATIONS
     std::cout << static_cast<double>(result.new_calls) / count;
-#else
-    std::cout << "null";
-#endif
-    std::cout << ",\"rpc_queue_latency\":";
-#ifdef LRPC_ENABLE_DIAGNOSTICS
-    if (config.transport != "rpc") std::cout << "null";
-    else {
-        std::cout << "{\"scope\":\"" << (config.role == "client" ? "client_process" : "both_endpoints")
-            << "\",\"population\":\"submitted_frames_only\",\"unit\":\"ns\",\"bucket_upper_bound\":\"2^index\",\"boundary\":\"enqueue_to_first_write_submission\",";
-        queue_distribution("requests", result.queues.requests); std::cout << ',';
-        if (config.role == "client") std::cout << "\"responses\":null";
-        else queue_distribution("responses", result.queues.responses);
-        std::cout << ','; queue_distribution("controls", result.queues.controls); std::cout << '}';
-    }
 #else
     std::cout << "null";
 #endif

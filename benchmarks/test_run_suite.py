@@ -19,7 +19,7 @@ class SampleValidation(unittest.TestCase):
                        success=counts[0], rejected=counts[8], timeout=counts[4], other_errors=0,
                        status_counts=counts, generator_drop=int(drop), target_rate=rate, burst=1,
                        max_schedule_lag_us=100, allocation_counting=diagnostic,
-                       queue_instrumentation=False, sanitizers=False, diagnostic_only=diagnostic,
+                       sanitizers=False, diagnostic_only=diagnostic,
                        load_faithful=faithful, eligible_for_zero_error_p99=eligible,
                        offer_lag=distribution(lag), schedule_lag=None if drop else distribution(lag),
                        success_scheduled=distribution(lag + 2000) if code == 0 and not drop else None,

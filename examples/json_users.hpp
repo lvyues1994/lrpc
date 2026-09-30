@@ -1,5 +1,7 @@
 #pragma once
+
 #include "users.hpp"
+
 #include <rpc/json.hpp>
 
 RPC_JSON_FIELDS(example::GetUserRequest, id);
@@ -10,11 +12,11 @@ RPC_JSON_FIELDS(example::RenameUserReply, updated);
 
 namespace example {
 inline rpc::json_method<GetUserRequest, GetUserReply> const &get_user_method() {
-    static rpc::json_method<GetUserRequest, GetUserReply> const value{"users/GetUser", rpc::idempotency::no_side_effects};
+    static rpc::json_method<GetUserRequest, GetUserReply> const value{"users/GetUser"};
     return value;
 }
 inline rpc::json_method<RenameUserRequest, RenameUserReply> const &rename_user_method() {
     static rpc::json_method<RenameUserRequest, RenameUserReply> const value{"users/RenameUser"};
     return value;
 }
-}
+} // namespace example

@@ -1,5 +1,6 @@
 #include <rpc/json.hpp>
-#include "client_fixture.hpp"
+#include "check.hpp"
+#include <cmath>
 #include <iostream>
 
 struct Item { std::int64_t id = 9; std::string text{"default"}; };
@@ -81,42 +82,8 @@ void limits() {
     bool rejected = false; try { rpc::json_codec<Recursive>::upper_bound(root); } catch (std::invalid_argument const &) { rejected = true; } CHECK(rejected);
     std::uint8_t bytes[4096]; CHECK(rpc::json_codec<Recursive>::encode_bounded(root, {bytes, sizeof(bytes)}).code == rpc::wire::error::invalid_argument);
 }
-void direct() {
-    test_client::fixture f; Item request{42, "hello"}, response;
-    auto method = rpc::json_method<Item, Item>{"JSON"}; auto call = rpc::bind(*f.client, method);
-    unsigned done = 0; rpc::call_result result;
-    auto start = [&](rpc::call_options options = {}) {
-        net::run_async(f.context.get_executor(), [&](rpc::call_result value) { result = value; ++done; }, [](std::exception_ptr e) { std::rethrow_exception(e); })
-            ([&] { return call(request, response, options); }); f.context.poll();
-    };
-    start(); auto frame = rpc::wire::decode_frame({f.pipe->output.data(), f.pipe->output.size()}); CHECK(frame.code == rpc::wire::error::none);
-    Item wire_request; CHECK(rpc::json_codec<Item>::decode(frame.value.body, wire_request) && wire_request.id == 42 && wire_request.text == "hello");
-    auto reply = test_client::reply(1); auto body = encode(Item{73, "owned reply"}); reply.resize(18 + body.size());
-    rpc::wire::encode_header({static_cast<std::uint32_t>(2 + body.size()), 1, rpc::wire::frame_type::end, 0, 2, 0}, {reply.data(), 16});
-    std::memcpy(reply.data() + 18, body.data(), body.size()); f.pipe->feed(reply); f.context.poll();
-    CHECK(done == 1 && result.code == rpc::status_code::ok && response.id == 73 && result.response_size == body.size());
-    f.pipe->output.clear(); request.text.assign(2000, 'a'); start(); CHECK(done == 2 && result.code == rpc::status_code::resource_exhausted && f.pipe->output.empty());
-    request.text = "valid"; rpc::call_options options; options.deadline = rpc::clock::now(); start(options);
-    CHECK(done == 3 && result.code == rpc::status_code::deadline_exceeded && f.pipe->output.empty());
-    f.zero();
-}
-auto respond(Required *reply) CO2_BEG(net::task<rpc::status_code>, (reply)) { reply->value = 1; CO2_RETURN(rpc::status_code::ok); }
-CO2_END
-struct limited_service {
-    bool entered = false;
-    net::task<rpc::status_code> Echo(rpc::server_context &, MemoryLimited const &, Required &reply) { entered = true; return respond(&reply); }
-};
-void decode_exhaustion() {
-    limited_service service; auto binding = rpc::bind_method(rpc::json_method<MemoryLimited, Required>{"Limited"}, service, &limited_service::Echo, {64, 2});
-    net::io_context context{net::default_backend, net::single_thread_hint}; std::string input = R"({"text":"123456789"})";
-    rpc::server_context call; std::uint8_t bytes[64]; rpc::response_writer writer{{bytes, sizeof(bytes)}};
-    rpc::status_code result = rpc::status_code::unknown;
-    net::run_async(context.get_executor(), [&](rpc::status_code value) { result = value; }, [](std::exception_ptr e) { std::rethrow_exception(e); })
-        ([&] { return binding.handler->invoke(call, {reinterpret_cast<std::uint8_t const *>(input.data()), input.size()}, writer); });
-    context.run(); CHECK(result == rpc::status_code::resource_exhausted && !service.entered && writer.size() == 0);
-}
 }
 int main() {
-    try { values(); rejected(); limits(); direct(); decode_exhaustion(); std::cout << "PASS JSON mapping, strict input, limits, bounded unary\n"; }
+    try { values(); rejected(); limits(); std::cout << "PASS JSON mapping, strict input, limits\n"; }
     catch (std::exception const &error) { std::cerr << error.what() << '\n'; return 1; }
 }

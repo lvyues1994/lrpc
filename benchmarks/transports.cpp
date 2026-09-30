@@ -1,7 +1,6 @@
 #include "bench.hpp"
-#include <rpc/runtime.hpp>
-#include <rpc/v2/client.hpp>
-#include <rpc/v2/server.hpp>
+#include <rpc/client.hpp>
+#include <rpc/server.hpp>
 
 #include <net/run_async.hpp>
 #include <net/stream.hpp>
@@ -13,9 +12,6 @@
 #include <csignal>
 #include <iostream>
 #include <unistd.h>
-#ifdef LRPC_BENCH_PROTOBUF
-#include <rpc/protobuf.hpp>
-#endif
 
 namespace bench {
 namespace {
@@ -28,140 +24,26 @@ CO2_END
 
 struct echo_handler final : rpc::method_handler {
     net::task<rpc::status_code> invoke(rpc::server_context &, rpc::wire::bytes_view request,
-                                      rpc::response_writer &response) override { return echo(request, response); }
+                                       rpc::response_writer &response) override {
+        return echo(request, response);
+    }
 };
-
-#ifdef LRPC_BENCH_PROTOBUF
-auto proto_echo(rpc::server_context &, lrpc_bench::Payload const &request, lrpc_bench::Payload &response)
-    CO2_BEG(net::task<rpc::status_code>, (request, response)) {
-    response.set_payload(request.payload());
-    CO2_RETURN(rpc::status_code::ok);
-}
-CO2_END
-struct proto_echo_service {
-    net::task<rpc::status_code> invoke(rpc::server_context &context, lrpc_bench::Payload const &request,
-                                      lrpc_bench::Payload &response) { return proto_echo(context, request, response); }
-};
-#endif
 
 struct rpc_channel final : channel {
-    rpc_channel(net::io_context &context, options const &config) : context(context), config(config), codec(config.codec), bytes(config.bytes) {
+    rpc_channel(net::io_context &ctx, options const &config) : shard(ctx) {
         rpc::server_options so{};
-        so.connection.receive = {8192, 8192, static_cast<std::uint32_t>(config.rpc_streams), 0, 16, 0};
-        so.connection.receive_buffer_bytes = config.receive_buffer_bytes;
-        so.max_connections = 1; so.max_active_calls = config.rpc_streams;
-        so.request_bytes = 8 * 1024 * 1024; so.response_bytes = 8 * 1024 * 1024;
-        rpc::client_options co{}; co.connection = so.connection;
-        co.connection.receive.max_concurrent_streams = static_cast<std::uint32_t>(config.inflight);
-        if (config.rpc_entry == "runtime") {
-            rpc::runtime_options ro; ro.shards = 2; ro.backend = config.backend; ro.cpu_affinity = {config.runtime_cpu0, config.runtime_cpu1};
-            runtime = rpc::make_runtime(ro);
-            std::vector<std::vector<rpc::method_binding>> methods(2);
-            for (auto &shard : methods) {
-#ifdef LRPC_BENCH_PROTOBUF
-                if (codec == "protobuf") shard.push_back(rpc::bind_method(operation, proto_service, &proto_echo_service::invoke, {config.bytes, 2, config.arena_cache}));
-                else
-#endif
-                    shard.push_back({"bench/Echo", config.bytes, &handler});
-            }
-            server = rpc::make_server(*runtime, std::move(methods), so);
-        } else if (config.role != "client") {
-#ifdef LRPC_BENCH_PROTOBUF
-            if (codec == "protobuf") server = rpc::make_server(context,
-                {rpc::bind_method(operation, proto_service, &proto_echo_service::invoke, {config.bytes, 2, config.arena_cache})}, so);
-            else
-#endif
-                server = rpc::make_server(context, {{"bench/Echo", config.bytes, &handler}}, so);
-        }
-        client_config = co;
-        if (config.role != "server" && config.rpc_entry == "client") client = rpc::make_client(context, co);
-        endpoint = {net::ip::address_v4::loopback(), config.port};
-        measured_deadline = std::chrono::microseconds{static_cast<std::int64_t>(config.deadline_us)};
-        deadline.timeout = config.deadline_us == 0 ? measured_deadline : std::max(measured_deadline, std::chrono::microseconds{1000000});
-    }
-    net::task<rpc::status_code> connect() override {
-        if (server) endpoint = server->listen({net::ip::address_v4::loopback(), 0});
-        if (config.rpc_entry != "client") {
-            rpc::channel_options options; options.connection = client_config; options.resolve = rpc::make_static_resolver({endpoint}); options.max_connections = 1;
-            std::unique_ptr<rpc::channel> c = runtime ? rpc::make_channel(*runtime, options) : rpc::make_channel(context, options);
-            auto *channel = c.get(); client = std::move(c); if (runtime) runtime->start(); return channel->warmup();
-        }
-        return client->connect(endpoint);
-    }
-    net::task<rpc::call_result> call(slot &storage) override {
-#ifdef LRPC_BENCH_PROTOBUF
-        if (codec == "protobuf") return rpc::call(*client, operation, storage.proto_request, storage.proto_reply, deadline);
-#endif
-        return client->call("bench/Echo", {storage.request.data(), storage.request.size()},
-                            {storage.reply.data(), storage.reply.size()}, deadline);
-    }
-    void prepare(slot &storage) override {
-#ifdef LRPC_BENCH_PROTOBUF
-        if (codec == "protobuf") {
-            auto const payload_size = bytes == 64 ? 62U : 4093U;
-            storage.proto_request.set_payload(storage.request.data(), payload_size);
-            if (storage.proto_request.ByteSizeLong() != bytes) throw std::logic_error{"protobuf encoded size mismatch"};
-        }
-#else
-        static_cast<void>(storage);
-#endif
-    }
-    bool validate(slot const &storage, rpc::call_result const &result) const override {
-#ifdef LRPC_BENCH_PROTOBUF
-        if (codec == "protobuf") return result.response_size == bytes &&
-            storage.proto_request.payload() == storage.proto_reply.payload();
-#endif
-        return channel::validate(storage, result);
-    }
-    void close() noexcept override { if (client) client->close(); if (server) server->close(); }
-    void join() override { if (runtime) runtime->shutdown(); }
-    void begin_measurement() noexcept override { deadline.timeout = measured_deadline; }
-    net::io_context &context;
-    options config;
-    rpc::client_options client_config;
-    echo_handler handler{};
-    std::unique_ptr<rpc::runtime> runtime;
-    std::unique_ptr<rpc::server> server{};
-    std::unique_ptr<rpc::client> client{};
-    net::ip::tcp::endpoint endpoint{};
-    rpc::call_options deadline{};
-    std::chrono::microseconds measured_deadline{};
-    std::string codec;
-    std::size_t bytes;
-#ifdef LRPC_BENCH_PROTOBUF
-    proto_echo_service proto_service{};
-    rpc::method<lrpc_bench::Payload, lrpc_bench::Payload> operation{"bench/ProtoEcho"};
-#endif
-};
-
-auto v2_echo(rpc::wire::bytes_view request, rpc::v2::response_writer &response)
-    CO2_BEG(net::task<rpc::v2::status_code>, (request, response)) {
-    CO2_RETURN(response.assign(request) ? rpc::v2::status_code::ok : rpc::v2::status_code::internal);
-}
-CO2_END
-
-struct v2_echo_handler final : rpc::v2::method_handler {
-    net::task<rpc::v2::status_code> invoke(rpc::v2::server_context &, rpc::wire::bytes_view request,
-                                           rpc::v2::response_writer &response) override {
-        return v2_echo(request, response);
-    }
-};
-
-struct v2_channel final : channel {
-    v2_channel(net::io_context &ctx, options const &config) : shard(ctx) {
-        rpc::v2::server_options so{};
         so.connection.receive.max_frame_size = 8192;
         so.connection.receive.max_message_size = 8192;
         so.connection.receive.max_concurrent_streams = static_cast<std::uint32_t>(config.rpc_streams);
         so.connection.receive_buffer_bytes = config.receive_buffer_bytes;
         so.max_connections = 1;
         so.max_active_calls = config.rpc_streams;
-        rpc::v2::client_options co{};
+        rpc::client_options co{};
         co.connection = so.connection;
         co.connection.receive.max_concurrent_streams = static_cast<std::uint32_t>(config.inflight);
-        if (config.role != "client") server.reset(new rpc::v2::server(shard, {{"bench/Echo", &handler, config.bytes}}, so));
+        if (config.role != "client") server.reset(new rpc::server(shard, {{"bench/Echo", &handler, config.bytes}}, so));
         if (config.role != "server") {
-            client.reset(new rpc::v2::client(shard, co));
+            client.reset(new rpc::client(shard, co));
             method = client->bind("bench/Echo");
         }
         endpoint = {net::ip::address_v4::loopback(), config.port};
@@ -180,35 +62,35 @@ struct v2_channel final : channel {
         if (client) client->close();
         if (server) server->close();
     }
-    rpc::v2::shard shard;
-    v2_echo_handler handler{};
-    std::unique_ptr<rpc::v2::server> server{};
-    std::unique_ptr<rpc::v2::client> client{};
-    rpc::v2::method_ref method{};
+    rpc::shard shard;
+    echo_handler handler{};
+    std::unique_ptr<rpc::server> server{};
+    std::unique_ptr<rpc::client> client{};
+    rpc::method_ref method{};
     net::ip::tcp::endpoint endpoint{};
-    rpc::v2::call_spec spec{};
-    rpc::v2::call_spec const *active_spec = nullptr;
+    rpc::call_spec spec{};
+    rpc::call_spec const *active_spec = nullptr;
     std::chrono::microseconds measured{};
 };
 
-auto v2_connect(v2_channel &self)
-    CO2_BEG(net::task<rpc::status_code>, (self), rpc::v2::status_code connected;) {
+auto rpc_connect(rpc_channel &self)
+    CO2_BEG(net::task<rpc::status_code>, (self), rpc::status_code connected;) {
     if (self.server) self.endpoint = self.server->listen({net::ip::address_v4::loopback(), 0});
     CO2_AWAIT_SET(connected, self.client->connect(self.endpoint));
-    CO2_RETURN(static_cast<rpc::status_code>(connected));
+    CO2_RETURN(connected);
 }
 CO2_END
 
-auto v2_call(v2_channel &self, slot &storage)
-    CO2_BEG(net::task<rpc::call_result>, (self, storage), rpc::v2::call_result result;) {
+auto rpc_call(rpc_channel &self, slot &storage)
+    CO2_BEG(net::task<rpc::call_result>, (self, storage), rpc::call_result result;) {
     CO2_AWAIT_SET(result, self.client->call(self.method, {storage.request.data(), storage.request.size()},
                                             {storage.reply.data(), storage.reply.size()}, self.active_spec));
-    CO2_RETURN((rpc::call_result{static_cast<rpc::status_code>(result.code), result.size}));
+    CO2_RETURN(result);
 }
 CO2_END
 
-net::task<rpc::status_code> v2_channel::connect() { return v2_connect(*this); }
-net::task<rpc::call_result> v2_channel::call(slot &storage) { return v2_call(*this, storage); }
+net::task<rpc::status_code> rpc_channel::connect() { return rpc_connect(*this); }
+net::task<rpc::call_result> rpc_channel::call(slot &storage) { return rpc_call(*this, storage); }
 
 // Fixed-capacity FIFO over driver-owned slots; no per-enqueue allocation.
 class slot_queue {
@@ -385,7 +267,6 @@ CO2_END
 
 std::unique_ptr<channel> make_channel(net::io_context &context, options const &config) {
     if (config.transport == "rpc") return std::make_unique<rpc_channel>(context, config);
-    if (config.transport == "v2") return std::make_unique<v2_channel>(context, config);
     return std::make_unique<raw_channel>(context, config);
 }
 
@@ -396,14 +277,12 @@ void serve(options const &config) {
     net::signal_set signals{context, SIGINT, SIGTERM};
     net::stop_source shutdown;
     std::unique_ptr<rpc_channel> rpc_server;
-    std::unique_ptr<v2_channel> v2_server;
     std::unique_ptr<raw_channel> raw_server;
     std::exception_ptr failure;
     bool stopped = false;
     auto close = [&] {
         shutdown.request_stop();
         if (rpc_server) rpc_server->close();
-        if (v2_server) v2_server->close();
         if (raw_server) raw_server->close();
         signals.cancel();
     };
@@ -412,9 +291,6 @@ void serve(options const &config) {
         if (config.transport == "rpc") {
             rpc_server = std::make_unique<rpc_channel>(context, config);
             endpoint = rpc_server->server->listen({net::ip::address_v4::loopback(), 0});
-        } else if (config.transport == "v2") {
-            v2_server = std::make_unique<v2_channel>(context, config);
-            endpoint = v2_server->server->listen({net::ip::address_v4::loopback(), 0});
         } else {
             raw_server = std::make_unique<raw_channel>(context, config);
             std::error_code error;
@@ -434,11 +310,6 @@ void serve(options const &config) {
     if (failure) std::rethrow_exception(failure);
     if (rpc_server) {
         auto const stats = rpc_server->server->stats();
-        if (stats.connections || stats.active_calls || stats.request_bytes_in_use || stats.response_bytes_in_use || stats.control_bytes_in_use)
-            throw std::runtime_error{"server retained live resources after drain"};
-    }
-    if (v2_server) {
-        auto const stats = v2_server->server->stats();
         if (stats.connections || stats.active_calls || stats.request_bytes || stats.response_bytes)
             throw std::runtime_error{"server retained live resources after drain"};
     }
