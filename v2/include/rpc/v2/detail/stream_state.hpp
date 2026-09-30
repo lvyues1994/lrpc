@@ -22,7 +22,7 @@ struct stream_state;
 // One static table per kind of stream: the reader dispatches without type tags.
 // Each callback runs on the shard's thread and must unregister the stream.
 struct stream_ops {
-    void (*on_frame)(stream_state &, wire::frame_view const &) noexcept;
+    bool (*on_frame)(stream_state &, wire::frame_view const &) noexcept; // False: protocol error.
     // Connection closed or going away; not_executed when the peer proved it
     // never started the stream.
     void (*on_abort)(stream_state &, status_code, bool not_executed) noexcept;

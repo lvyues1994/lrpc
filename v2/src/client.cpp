@@ -74,18 +74,8 @@ struct call_access {
         if (auto &conn = call.core_->conn) conn->send_control(wire::frame_type::cancel, call.id, 0, 0);
     }
 
-    static void keep_trailer(response_trailer &trailer, wire::bytes_view const head) noexcept {
-        if (head.size > trailer.storage.size) {
-            trailer.truncated = true;
-            return;
-        }
-        std::memcpy(trailer.storage.data, head.data, head.size);
-        auto const decoded = wire::decode_end_head({trailer.storage.data, head.size}).value; // Validated.
-        trailer.message = decoded.message;
-        trailer.metadata = decoded.metadata;
-    }
-
-    static void on_frame(stream_state &stream, wire::frame_view const &frame) noexcept {
+    static bool on_frame(stream_state &stream, wire::frame_view const &frame) noexcept {
+        if (frame.header.type != wire::frame_type::end) return false;
         auto &call = of(stream);
         if (call.trailer_ != nullptr && frame.head.size > 2) keep_trailer(*call.trailer_, frame.head);
         auto code = static_cast<status_code>(frame.header.aux);
@@ -98,6 +88,7 @@ struct call_access {
             }
         }
         finish(call, code, (frame.header.flags & wire::not_executed) != 0, true);
+        return true;
     }
 
     static void on_abort(stream_state &stream, status_code const code, bool const not_executed) noexcept {
@@ -123,6 +114,7 @@ struct call_access {
 namespace {
 stream_ops const unary_ops{&call_access::on_frame, &call_access::on_abort, &call_access::on_deadline,
                            &call_access::on_cancel};
+} // namespace
 
 std::uint64_t remaining_us(clock::duration const remaining) noexcept {
     auto const whole = std::chrono::duration_cast<std::chrono::microseconds>(remaining);
@@ -130,7 +122,17 @@ std::uint64_t remaining_us(clock::duration const remaining) noexcept {
     if (whole < remaining) ++micros;
     return std::max<std::uint64_t>(micros, 1);
 }
-} // namespace
+
+void keep_trailer(response_trailer &trailer, wire::bytes_view const head) noexcept {
+    if (head.size > trailer.storage.size) {
+        trailer.truncated = true;
+        return;
+    }
+    std::memcpy(trailer.storage.data, head.data, head.size);
+    auto const decoded = wire::decode_end_head({trailer.storage.data, head.size}).value; // Validated.
+    trailer.message = decoded.message;
+    trailer.metadata = decoded.metadata;
+}
 
 status_code call_access::start(unary_call &call) noexcept {
     auto const &env = *call.env_;
@@ -140,8 +142,8 @@ status_code call_access::start(unary_call &call) noexcept {
     if (call.method_ == 0 || call.method_ > core->methods.size()) return status_code::invalid_argument;
     auto &conn = *core->conn;
     auto const &peer = conn.peer();
-    if (call.method_ > peer.max_method_ids || !core->has_room() ||
-        conn.queued_bytes() > conn.options.tx_high_watermark || call.request_.size > peer.max_message_size)
+    if (!core->has_room() || conn.queued_bytes() > conn.options.tx_high_watermark ||
+        call.request_.size > peer.max_message_size)
         return status_code::resource_exhausted;
     if (core->next_id > wire::max_stream_id) {
         core->going_away = true;
@@ -168,56 +170,79 @@ status_code call_access::start(unary_call &call) noexcept {
         timeout_us = remaining_us(call.deadline_ - current);
     }
 
-    auto &slot = core->methods[call.method_ - 1];
-    bool const intern = !slot.interned;
-    wire::request_head head{};
-    head.timeout_us = timeout_us;
-    if (intern) head.method_name = {reinterpret_cast<std::uint8_t const *>(slot.name.data()), slot.name.size()};
-    if (call.spec_ != nullptr) head.metadata = call.spec_->metadata;
-    auto const head_size = wire::request_head_size(head, intern);
-    if (head_size.code != wire::error::none || head_size.written > 0xffffU) return status_code::invalid_argument;
-    auto const payload = head_size.written + call.request_.size;
-    if (payload > peer.max_frame_size) return status_code::resource_exhausted;
+    request_plan plan{};
+    auto const planned = plan_request(*core, core->methods[call.method_ - 1], timeout_us,
+                                      call.spec_ != nullptr ? call.spec_->metadata : wire::metadata_list{},
+                                      call.request_.size, plan);
+    if (planned != status_code::ok) return planned;
 
     // A retried call keeps the hook of its first attempt.
     stop_hook *hook = nullptr;
     std::uint8_t *frame = nullptr;
     try {
         if (call.hook_ == nullptr && env.stop_token.stop_possible()) hook = core->shard.acquire_hook();
-        frame = conn.reserve(wire::header_size + payload);
+        frame = conn.reserve(wire::header_size + plan.payload);
     } catch (std::bad_alloc const &) {
         if (hook != nullptr) core->shard.release_hook(*hook);
         return status_code::resource_exhausted;
     }
     auto const id = core->next_id;
-    wire::frame_header header{};
-    header.length = static_cast<std::uint32_t>(payload);
-    header.stream_id = id;
-    header.type = wire::frame_type::request;
-    header.flags = static_cast<std::uint8_t>(wire::end_stream | (intern ? wire::new_method : 0));
-    header.head_length = static_cast<std::uint16_t>(head_size.written);
-    header.aux = call.method_;
-    if (wire::encode_header(header, {frame, wire::header_size}, conn.outgoing()).code != wire::error::none ||
-        wire::encode_request_head(head, intern, {frame + wire::header_size, head_size.written}).code !=
-            wire::error::none) {
+    if (!write_request(*core, plan, frame, id, call.request_, true)) {
         if (hook != nullptr) core->shard.release_hook(*hook);
         return status_code::internal;
     }
-    if (call.request_.size != 0)
-        std::memcpy(frame + wire::header_size + head_size.written, call.request_.data, call.request_.size);
-    ++core->next_id;
-    slot.interned = true;
     call.id = id;
     call.ops = &unary_ops;
     core->streams.insert(call);
     if (call.deadline_ != clock::time_point::max()) core->shard.schedule(call, call.deadline_);
     call.phase_ = call_pending;
-    conn.commit(wire::header_size + payload);
+    conn.commit(wire::header_size + plan.payload);
     if (hook != nullptr) {
         call.hook_ = hook;
         hook->attach(call, env.stop_token); // Last: the request may already be pending.
     }
     return status_code::ok;
+}
+
+status_code plan_request(client_core &core, method_slot &slot, std::uint64_t const timeout_us,
+                         wire::metadata_list const metadata, std::size_t const body, request_plan &plan) noexcept {
+    auto const &peer = core.conn->peer();
+    plan.slot = &slot;
+    plan.intern = slot.wire_id == 0;
+    plan.wire_id = plan.intern ? core.next_method : slot.wire_id;
+    if (plan.wire_id > peer.max_method_ids) return status_code::resource_exhausted;
+    plan.head.timeout_us = timeout_us;
+    if (plan.intern) plan.head.method_name = {reinterpret_cast<std::uint8_t const *>(slot.name.data()), slot.name.size()};
+    plan.head.metadata = metadata;
+    auto const head_size = wire::request_head_size(plan.head, plan.intern);
+    if (head_size.code != wire::error::none || head_size.written > 0xffffU) return status_code::invalid_argument;
+    plan.head_size = head_size.written;
+    plan.payload = plan.head_size + body;
+    if (plan.payload > peer.max_frame_size) return status_code::resource_exhausted;
+    return status_code::ok;
+}
+
+bool write_request(client_core &core, request_plan const &plan, std::uint8_t *const frame, std::uint32_t const id,
+                   wire::bytes_view const body, bool const end_stream) noexcept {
+    auto &conn = *core.conn;
+    wire::frame_header header{};
+    header.length = static_cast<std::uint32_t>(plan.payload);
+    header.stream_id = id;
+    header.type = wire::frame_type::request;
+    header.flags = static_cast<std::uint8_t>((end_stream ? wire::end_stream : 0) | (plan.intern ? wire::new_method : 0));
+    header.head_length = static_cast<std::uint16_t>(plan.head_size);
+    header.aux = plan.wire_id;
+    if (wire::encode_header(header, {frame, wire::header_size}, conn.outgoing()).code != wire::error::none ||
+        wire::encode_request_head(plan.head, plan.intern, {frame + wire::header_size, plan.head_size}).code !=
+            wire::error::none)
+        return false;
+    if (body.size != 0) std::memcpy(frame + wire::header_size + plan.head_size, body.data, body.size);
+    ++core.next_id;
+    if (plan.intern) {
+        plan.slot->wire_id = plan.wire_id;
+        ++core.next_method;
+    }
+    return true;
 }
 
 bool client_core::on_frame(wire::frame_view const &frame) noexcept {
@@ -229,9 +254,13 @@ bool client_core::on_frame(wire::frame_view const &frame) noexcept {
             if (head.code != wire::error::none) return false;
             if (header.aux == 0 && head.value.message.size != 0) return false; // Messages accompany errors only.
         }
-        if (auto *stream = streams.find(header.stream_id)) stream->ops->on_frame(*stream, frame);
-        else if (header.stream_id >= next_id) return false; // Late ENDs of finished calls are expected.
-        return true;
+        if (auto *stream = streams.find(header.stream_id)) return stream->ops->on_frame(*stream, frame);
+        return header.stream_id < next_id; // Late ENDs of finished calls are expected.
+    case wire::frame_type::message:
+    case wire::frame_type::window_update:
+    case wire::frame_type::cancel:
+        if (auto *stream = streams.find(header.stream_id)) return stream->ops->on_frame(*stream, frame);
+        return header.stream_id < next_id;
     case wire::frame_type::goaway: {
         going_away = true;
         std::vector<stream_state *> unstarted;
@@ -379,7 +408,7 @@ method_ref client::bind(std::string const &name) {
     auto &methods = core_->methods;
     for (std::size_t index = 0; index != methods.size(); ++index)
         if (methods[index].name == name) return method_ref{static_cast<std::uint32_t>(index + 1)};
-    methods.push_back(detail::method_slot{name, false});
+    methods.push_back(detail::method_slot{name, 0});
     return method_ref{static_cast<std::uint32_t>(methods.size())};
 }
 

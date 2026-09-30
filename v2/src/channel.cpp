@@ -54,7 +54,7 @@ struct channel_core final : call_router {
 
     std::shared_ptr<client_core> make_client() {
         auto created = std::make_shared<client_core>(shard, options.client);
-        for (auto const &name : methods) created->methods.push_back(method_slot{name, false});
+        for (auto const &name : methods) created->methods.push_back(method_slot{name, 0});
         return created;
     }
     std::size_t ready_count() const noexcept {
@@ -168,13 +168,17 @@ method_ref channel::bind(std::string const &name) {
         if (methods[index] == name) return method_ref{static_cast<std::uint32_t>(index + 1)};
     methods.push_back(name);
     for (auto &sub : core_->subs)
-        if (sub.client) sub.client->methods.push_back(detail::method_slot{name, false});
+        if (sub.client) sub.client->methods.push_back(detail::method_slot{name, 0});
     return method_ref{static_cast<std::uint32_t>(methods.size())};
 }
 
 unary_call channel::call(method_ref method, wire::bytes_view request, wire::mutable_bytes_view response,
                          call_spec const *spec, response_trailer *trailer) noexcept {
     return unary_call{nullptr, core_.get(), method.index, request, response, spec, trailer};
+}
+
+open_operation channel::open(method_ref const method, method_kind const kind, call_spec const *spec) noexcept {
+    return open_operation{nullptr, core_.get(), method.index, kind, spec};
 }
 
 std::size_t channel::ready_connections() const noexcept { return core_->ready_count(); }

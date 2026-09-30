@@ -15,7 +15,7 @@
 | `lrpc::protobuf` | 可选的 protobuf codec、类型化服务适配器及每调用 Arena，带 2 KiB 内联初始块 |
 | `lrpc::json` | 可选的普通结构体 JSON 映射、严格 SAX 校验、有界单次编码和类型化方法/stub |
 | `protoc-gen-rpc` | 生成冷绑定的客户端 Stub、服务端接口、方法描述符、builder 注册和每方法容量配置 |
-| `lrpc::v2` | 重写的一元引擎：同一线协议，调用零分配，见 [v2 说明](docs/v2.md) |
+| `lrpc::v2` | 重写的引擎：一元、流式、channel，与 v1 同一线协议，一元调用零分配，见 [v2 说明](docs/v2.md) |
 
 流式 profile 支持上传流、下载流、双向流、MESSAGE 分片、窗口背压、半关闭和跨分片调用；生成器覆盖四种方法。
 公开接口见 [unary.hpp](unary/include/rpc/unary.hpp)、[stream.hpp](unary/include/rpc/stream.hpp) 和 [runtime.hpp](runtime/include/rpc/runtime.hpp)。

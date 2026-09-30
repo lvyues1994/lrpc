@@ -43,6 +43,8 @@ public:
     method_ref bind(std::string const &name);
     unary_call call(method_ref method, wire::bytes_view request, wire::mutable_bytes_view response,
                     call_spec const *spec = nullptr, response_trailer *trailer = nullptr) noexcept;
+    // On the least loaded ready connection; streams are not retried.
+    open_operation open(method_ref method, method_kind kind, call_spec const *spec = nullptr) noexcept;
     std::size_t ready_connections() const noexcept;
     void close() noexcept;
 

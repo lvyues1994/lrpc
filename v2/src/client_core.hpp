@@ -17,7 +17,9 @@ enum : std::uint8_t { call_idle = 0, call_pending = 1, call_done = 2 };
 
 struct method_slot {
     std::string name;
-    bool interned = false; // NEW_METHOD has been queued on this connection.
+    // Wire ID on this connection, zero until NEW_METHOD is queued. IDs are
+    // handed out in order of first use, as v1's streaming server requires.
+    std::uint32_t wire_id = 0;
 };
 
 // Chooses the connection for each attempt of a routed call.
@@ -63,6 +65,7 @@ struct client_core final : connection_handler {
     stream_table streams;
     std::vector<method_slot> methods;
     std::uint32_t next_id = 1;
+    std::uint32_t next_method = 1;
     bool going_away = false;
     bool handshake_done = false;
     bool closed = false;
@@ -71,6 +74,23 @@ struct client_core final : connection_handler {
     event closed_event; // The connection started closing.
     status_code connect_status = status_code::unavailable;
 };
+
+// A REQUEST frame sized and checked before space is reserved for it.
+struct request_plan {
+    method_slot *slot = nullptr;
+    wire::request_head head{};
+    std::size_t head_size = 0;
+    std::size_t payload = 0;
+    std::uint32_t wire_id = 0;
+    bool intern = false;
+};
+status_code plan_request(client_core &core, method_slot &slot, std::uint64_t timeout_us, wire::metadata_list metadata,
+                         std::size_t body, request_plan &plan) noexcept;
+// Encodes into reserved space and takes the stream ID; the caller commits.
+bool write_request(client_core &core, request_plan const &plan, std::uint8_t *frame, std::uint32_t id,
+                   wire::bytes_view body, bool end_stream) noexcept;
+std::uint64_t remaining_us(clock::duration remaining) noexcept;
+void keep_trailer(response_trailer &trailer, wire::bytes_view head) noexcept;
 
 net::task<status_code> connect_client(std::shared_ptr<client_core> core, net::ip::tcp::endpoint endpoint);
 net::task<status_code> attach_client(std::shared_ptr<client_core> core, std::unique_ptr<transport> link);

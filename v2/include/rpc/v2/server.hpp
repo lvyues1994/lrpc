@@ -3,6 +3,7 @@
 #include <rpc/v2/options.hpp>
 #include <rpc/v2/shard.hpp>
 #include <rpc/v2/status.hpp>
+#include <rpc/v2/stream.hpp>
 #include <rpc/v2/transport.hpp>
 
 #include <net/task.hpp>
@@ -24,7 +25,7 @@ struct server_context {
 };
 
 namespace detail {
-struct server_call;
+struct response_state;
 struct server_access;
 } // namespace detail
 
@@ -43,7 +44,7 @@ public:
 
 private:
     friend struct detail::server_access;
-    detail::server_call *call_ = nullptr;
+    detail::response_state *call_ = nullptr;
 };
 
 struct method_handler {
@@ -53,13 +54,24 @@ struct method_handler {
                                           response_writer &response) = 0;
 };
 
+// For every kind but unary. The END is sent when the returned task
+// completes: client_streaming must have written exactly one message, and
+// server_streaming must have read one message and the end of the stream.
+struct stream_method_handler {
+    virtual ~stream_method_handler() = default;
+    virtual net::task<status_code> invoke(server_context &context, server_stream &stream) = 0;
+};
+
 struct method_binding {
     std::string name{};
-    method_handler *handler = nullptr; // Borrowed until the server has drained.
-    // Both are charged to the response ledger for every admitted call, so
-    // they bound concurrency as well as the reply.
+    method_handler *handler = nullptr; // Borrowed until the server has drained; unary only.
+    // For unary calls both are charged to the response ledger for every
+    // admitted call, so they bound concurrency as well as the reply. For
+    // streams the first bounds each message written.
     std::size_t max_response_bytes = 0;
     std::size_t max_trailer_bytes = 0; // Encoded END head; zero allows no trailer.
+    method_kind kind = method_kind::unary;
+    stream_method_handler *stream_handler = nullptr; // Borrowed; every other kind.
 };
 
 struct server_options {

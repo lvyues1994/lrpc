@@ -1,6 +1,7 @@
 #include <rpc/v2/server.hpp>
 
 #include "engine.hpp"
+#include "stream_core.hpp"
 
 #include <net/error.hpp>
 #include <net/memory_resource.hpp>
@@ -26,6 +27,8 @@ constexpr std::size_t end_head_bytes = 2;                                   // E
 struct method_entry {
     std::string name;
     method_handler *handler;
+    stream_method_handler *stream_handler;
+    method_kind kind;
     std::size_t max_response;
     std::size_t max_trailer;
     std::size_t max_head() const noexcept { return std::max(max_trailer, end_head_bytes); }
@@ -35,23 +38,49 @@ struct method_entry {
 struct server_core;
 struct session;
 
-struct server_call final : stream_state {
-    explicit server_call(server_core &owner) noexcept;
-    static net::coroutine_handle<> on_done(void *self) noexcept;
-
-    server_core *core;
-    session *owner = nullptr;
+// Response storage and END trailer of one call, streaming or not.
+struct response_state {
+    server_core *core = nullptr;
     method_entry const *method = nullptr;
-    wire::bytes_view request{};
-    std::uint8_t *request_block = nullptr;
-    std::size_t request_capacity = 0;
-    std::size_t request_charge = 0;
     std::uint8_t *response_block = nullptr;
     std::size_t response_capacity = 0;
     std::size_t response_size = 0;
     std::uint8_t *trailer_block = nullptr; // Encoded END head, max_trailer bytes.
     std::size_t trailer_size = 0;
     std::size_t trailer_metadata = 0; // Offset of the metadata block, after the message.
+
+    // The wire carries a status message only with an error: ok keeps just the metadata.
+    std::size_t skipped(bool const ok) const noexcept { return ok && trailer_size != 0 ? trailer_metadata - 1 : 0; }
+    std::size_t end_head(bool const ok) const noexcept {
+        return trailer_size != 0 ? trailer_size - skipped(ok) : end_head_bytes;
+    }
+    void write_end_head(std::uint8_t *out, bool const ok) const noexcept {
+        if (trailer_size == 0) {
+            out[0] = out[1] = 0;
+        } else if (skipped(ok) == 0) {
+            std::memcpy(out, trailer_block, trailer_size);
+        } else {
+            out[0] = 0; // Empty message.
+            std::memcpy(out + 1, trailer_block + trailer_metadata, trailer_size - trailer_metadata);
+        }
+    }
+    void release_response(slab &memory) noexcept {
+        memory.deallocate(response_block, response_capacity);
+        if (trailer_block != nullptr) memory.deallocate(trailer_block, method->max_trailer);
+        response_block = trailer_block = nullptr;
+        response_capacity = response_size = trailer_size = 0;
+    }
+};
+
+struct server_call final : stream_state, response_state {
+    explicit server_call(server_core &owner) noexcept;
+    static net::coroutine_handle<> on_done(void *self) noexcept;
+
+    session *owner = nullptr;
+    wire::bytes_view request{};
+    std::uint8_t *request_block = nullptr;
+    std::size_t request_capacity = 0;
+    std::size_t request_charge = 0;
     server_context context{};
     response_writer writer{};
     // Reused while no stop was requested; the context documents that its
@@ -66,9 +95,45 @@ struct server_call final : stream_state {
     server_call *next_free = nullptr;
 };
 
+// A stream, including a unary call that arrived as one (as v1's streaming
+// client sends every unary call).
+struct server_stream_call final : stream_core, response_state {
+    server_stream_call(server_core &owner, session &from, method_entry const &entry); // Throws std::bad_alloc.
+    ~server_stream_call() override;
+    static net::coroutine_handle<> on_done(void *self) noexcept;
+
+    void fail(status_code const code) noexcept override { stop_with(code); }
+    // Ends reads and writes and stops the handler; the END waits for it.
+    void stop_with(status_code const code) noexcept {
+        if (forced == status_code::ok) forced = code;
+        if (!ended) {
+            ended = true;
+            result = code;
+            drop_messages();
+            wake_all();
+        }
+        stop.request_stop(); // Last: the handler may complete synchronously.
+    }
+
+    session *owner;
+    std::uint8_t *head_block = nullptr; // Request head, for the metadata view.
+    std::size_t head_capacity = 0;
+    std::size_t head_charge = 0;
+    inbound_message request{}; // Extended unary only.
+    server_context context{};
+    server_stream handle{};
+    response_writer writer{};
+    net::stop_source stop;
+    net::io_env env{};
+    net::task<status_code> task{};
+    net::detail::completion_frame done;
+    status_code forced = status_code::ok;
+    bool remote_cancelled = false;
+    bool detached = false;
+};
+
 struct server_access {
-    static void bind(response_writer &writer, server_call *call) noexcept { writer.call_ = call; }
-    static server_call *call(response_writer const &writer) noexcept { return writer.call_; }
+    static void bind(response_writer &writer, response_state *call) noexcept { writer.call_ = call; }
 };
 
 struct method_slot {
@@ -113,9 +178,13 @@ struct session final : connection_handler {
 
     bool on_request(wire::frame_view const &frame) noexcept;
     void reject(std::uint32_t stream, status_code code) noexcept;
+    void start_stream(method_entry const &entry, wire::frame_view const &frame, wire::metadata_view metadata,
+                      clock::time_point deadline) noexcept;
     void invoke(server_call &call) noexcept;
+    void invoke(server_stream_call &call) noexcept;
     void complete(server_call &call, status_code code) noexcept;
-    void send_end(server_call &call, status_code code) noexcept;
+    void complete(server_stream_call &call, status_code code) noexcept;
+    void send_end(std::uint32_t stream, response_state const &state, status_code code, bool with_body) noexcept;
     void goaway() noexcept;
     void release_if_done() noexcept;
 
@@ -137,7 +206,7 @@ namespace {
 
 server_call &call_of(stream_state &stream) noexcept { return static_cast<server_call &>(stream); }
 
-void call_frame(stream_state &, wire::frame_view const &) noexcept {}
+bool call_frame(stream_state &, wire::frame_view const &) noexcept { return false; }
 
 void call_abort(stream_state &stream, status_code const code, bool) noexcept {
     auto &call = call_of(stream);
@@ -161,14 +230,115 @@ void call_cancel(stream_state &stream) noexcept {
 
 stream_ops const server_ops{&call_frame, &call_abort, &call_deadline, &call_cancel};
 
+server_stream_call &stream_of(stream_state &node) noexcept { return static_cast<server_stream_call &>(node); }
+
+bool stream_frame(stream_state &node, wire::frame_view const &frame) noexcept {
+    auto &call = stream_of(node);
+    switch (frame.header.type) {
+    case wire::frame_type::message: return call.on_message(frame);
+    case wire::frame_type::window_update: return call.on_window(frame);
+    default: return false;
+    }
+}
+
+void stream_abort(stream_state &node, status_code const code, bool) noexcept {
+    auto &call = stream_of(node);
+    call.detached = true;
+    call.owner->streams.erase(call.id);
+    call.conn = nullptr;
+    call.stop_with(code);
+}
+
+void stream_deadline(stream_state &node) noexcept { stream_of(node).stop_with(status_code::deadline_exceeded); }
+
+void stream_cancel(stream_state &node) noexcept {
+    auto &call = stream_of(node);
+    call.remote_cancelled = true;
+    call.stop_with(status_code::cancelled);
+}
+
+stream_ops const server_stream_ops{&stream_frame, &stream_abort, &stream_deadline, &stream_cancel};
+
+// v1's streaming client sends unary calls as one MESSAGE and a half-close,
+// and expects one MESSAGE before the END.
+auto unary_over_stream(server_stream_call &call)
+    CO2_BEG(net::task<status_code>, (call), stream_read read; status_code code = status_code::ok;) {
+    CO2_AWAIT_SET(read, stream_access::read(&call));
+    if (read.code != status_code::ok || read.ended)
+        CO2_RETURN(read.code != status_code::ok ? read.code : status_code::invalid_argument);
+    call.request = std::exchange(call.current, inbound_message{}); // Outlives the next read.
+    CO2_AWAIT_SET(read, stream_access::read(&call));
+    if (read.code != status_code::ok || !read.ended)
+        CO2_RETURN(read.code != status_code::ok ? read.code : status_code::invalid_argument);
+    CO2_AWAIT_SET(code, call.method->handler->invoke(call.context, {call.request.block, call.request.size}, call.writer));
+    if (code != status_code::ok) CO2_RETURN(code);
+    CO2_AWAIT_SET(code, stream_access::write(&call, {call.response_block, call.response_size}, false));
+    CO2_RETURN(code);
+}
+CO2_END
+
+struct allocator_scope {
+    explicit allocator_scope(net::memory_resource *resource) noexcept : saved(net::get_cached_frame_allocator()) {
+        net::set_cached_frame_allocator(resource);
+    }
+    ~allocator_scope() { net::set_cached_frame_allocator(saved); }
+    net::memory_resource *saved;
+};
+
+bool set_trailer(response_state &call, wire::bytes_view const message, wire::metadata_list const metadata) noexcept {
+    if (call.method == nullptr || call.method->max_trailer == 0) return false;
+    auto const limit = call.method->max_trailer;
+    if (call.trailer_block == nullptr) {
+        try {
+            call.trailer_block = call.core->shard.memory.allocate(limit);
+        } catch (std::bad_alloc const &) {
+            return false;
+        }
+    }
+    auto const encoded = wire::encode_end_head({message, metadata}, {call.trailer_block, limit});
+    std::array<std::uint8_t, 10> length{};
+    auto const prefix = wire::encode_varint(message.size, {length.data(), length.size()});
+    call.trailer_size = encoded.code == wire::error::none ? encoded.written : 0;
+    call.trailer_metadata = prefix.written + message.size;
+    return call.trailer_size != 0;
+}
+
 } // namespace
 
-server_call::server_call(server_core &owner) noexcept : core(&owner), done(&server_call::on_done, this) {
+server_call::server_call(server_core &owner) noexcept : done(&server_call::on_done, this) {
+    core = &owner;
     server_access::bind(writer, this);
 }
 
 net::coroutine_handle<> server_call::on_done(void *const self) noexcept {
     auto &call = *static_cast<server_call *>(self);
+    auto code = status_code::internal;
+    try {
+        code = call.task.await_resume();
+    } catch (...) {
+    }
+    call.task = net::task<status_code>{};
+    call.owner->complete(call, code);
+    return net::noop_coroutine();
+}
+
+server_stream_call::server_stream_call(server_core &owner, session &from, method_entry const &entry)
+    : stream_core(owner.shard, entry.kind, false), owner(&from), done(&server_stream_call::on_done, this) {
+    core = &owner;
+    method = &entry;
+    stream_access::bind(handle, this);
+    server_access::bind(writer, this);
+}
+
+server_stream_call::~server_stream_call() {
+    auto &memory = core->shard.memory;
+    memory.deallocate(head_block, head_capacity);
+    memory.deallocate(request.block, request.capacity);
+    release_response(memory);
+}
+
+net::coroutine_handle<> server_stream_call::on_done(void *const self) noexcept {
+    auto &call = *static_cast<server_stream_call *>(self);
     auto code = status_code::internal;
     try {
         code = call.task.await_resume();
@@ -185,12 +355,14 @@ server_core::server_core(shard_state &state, std::vector<method_binding> binding
     : shard(state), options(config), frame_allocator(state.context.get_frame_allocator()) {
     methods.reserve(bindings.size());
     for (auto &binding : bindings) {
-        if (binding.name.empty() || binding.handler == nullptr || binding.max_trailer_bytes > 0xffffU)
+        bool const unary = binding.kind == method_kind::unary;
+        if (binding.name.empty() || binding.max_trailer_bytes > 0xffffU || binding.kind > method_kind::bidirectional ||
+            (unary ? binding.handler == nullptr : binding.stream_handler == nullptr))
             throw std::invalid_argument{"invalid method binding"};
         for (auto const &existing : methods)
             if (existing.name == binding.name) throw std::invalid_argument{"duplicate method " + binding.name};
-        methods.push_back(method_entry{std::move(binding.name), binding.handler, binding.max_response_bytes,
-                                       binding.max_trailer_bytes});
+        methods.push_back(method_entry{std::move(binding.name), binding.handler, binding.stream_handler, binding.kind,
+                                       binding.max_response_bytes, binding.max_trailer_bytes});
     }
     shard.endpoint_opened();
 }
@@ -220,11 +392,9 @@ server_call &server_core::acquire_call() {
 
 void server_core::release_call(server_call &call) noexcept {
     shard.memory.deallocate(call.request_block, call.request_capacity);
-    shard.memory.deallocate(call.response_block, call.response_capacity);
-    if (call.trailer_block != nullptr) shard.memory.deallocate(call.trailer_block, call.method->max_trailer);
-    call.request_block = call.response_block = call.trailer_block = nullptr;
-    call.request_capacity = call.response_capacity = call.response_size = call.request_charge = 0;
-    call.trailer_size = 0;
+    call.release_response(shard.memory);
+    call.request_block = nullptr;
+    call.request_capacity = call.request_charge = 0;
     call.request = {};
     call.context.deadline = clock::time_point::max();
     call.context.metadata = {};
@@ -309,6 +479,10 @@ bool session::on_frame(wire::frame_view const &frame) noexcept {
     auto const &header = frame.header;
     switch (header.type) {
     case wire::frame_type::request: return on_request(frame);
+    case wire::frame_type::message:
+    case wire::frame_type::window_update:
+        if (auto *stream = streams.find(header.stream_id)) return stream->ops->on_frame(*stream, frame);
+        return header.stream_id <= last_request; // Late frames of a finished stream.
     case wire::frame_type::cancel:
         if (header.stream_id > last_request) return false;
         if (auto *stream = streams.find(header.stream_id)) stream->ops->on_cancel(*stream);
@@ -329,6 +503,7 @@ bool session::on_request(wire::frame_view const &frame) noexcept {
         return false;
     last_request = header.stream_id;
     bool const defines = (header.flags & wire::new_method) != 0;
+    bool const streaming = (header.flags & wire::end_stream) == 0;
     auto const head = wire::decode_request_head(frame.head, defines);
     if (head.code != wire::error::none) return false;
     if (header.aux >= ids.size()) {
@@ -351,22 +526,28 @@ bool session::on_request(wire::frame_view const &frame) noexcept {
     if (goaway_sent || core->draining) return reject(header.stream_id, status_code::unavailable), true;
     if (!slot.defined) return reject(header.stream_id, status_code::failed_precondition), true;
     if (slot.entry == nullptr) return reject(header.stream_id, status_code::unimplemented), true;
-
     auto const &entry = *slot.entry;
+    if (!streaming && entry.kind != method_kind::unary) return reject(header.stream_id, status_code::invalid_argument), true;
+
     auto const &peer = conn.peer();
     auto const &limits = core->options;
     auto &stats = core->stats;
-    if (frame.body.size > conn.options.receive.max_message_size || entry.max_response > peer.max_message_size ||
-        entry.max_head() > peer.max_frame_size || entry.max_response > peer.max_frame_size - entry.max_head() ||
-        streams.size() >= streams.limit() || stats.active_calls >= limits.max_active_calls ||
+    if (streams.size() >= streams.limit() || stats.active_calls >= limits.max_active_calls ||
+        entry.max_response > peer.max_message_size || entry.max_head() > peer.max_frame_size ||
         header.length > limits.max_request_bytes - stats.request_bytes ||
-        entry.charge() > limits.max_response_bytes - stats.response_bytes)
+        (!streaming && (frame.body.size > conn.options.receive.max_message_size ||
+                        entry.max_response > peer.max_frame_size - entry.max_head() ||
+                        entry.charge() > limits.max_response_bytes - stats.response_bytes)))
         return reject(header.stream_id, status_code::resource_exhausted), true;
 
     auto deadline = clock::time_point::max();
     if (head.value.timeout_us != 0)
         deadline = now() + std::chrono::microseconds{
                                static_cast<std::int64_t>(std::min(head.value.timeout_us, max_timeout_us))};
+    if (streaming) {
+        start_stream(entry, frame, head.value.metadata, deadline);
+        return true;
+    }
 
     server_call *call = nullptr;
     try {
@@ -412,14 +593,45 @@ bool session::on_request(wire::frame_view const &frame) noexcept {
     return true;
 }
 
+void session::start_stream(method_entry const &entry, wire::frame_view const &frame, wire::metadata_view metadata,
+                           clock::time_point const deadline) noexcept {
+    auto const id = frame.header.stream_id;
+    if (conn.options.receive.initial_stream_window == 0) return reject(id, status_code::unimplemented);
+    server_stream_call *call = nullptr;
+    try {
+        call = new server_stream_call(*core, *this, entry);
+        if (frame.head.size != 0) {
+            call->head_block = core->shard.memory.allocate(frame.head.size);
+            call->head_capacity = slab::block_size(frame.head.size);
+        }
+    } catch (std::bad_alloc const &) {
+        delete call;
+        return reject(id, status_code::resource_exhausted);
+    }
+    if (frame.head.size != 0) std::memcpy(call->head_block, frame.head.data, frame.head.size);
+    metadata.entries.data =
+        metadata.entries.size != 0 ? call->head_block + (metadata.entries.data - frame.head.data) : nullptr;
+    call->id = id;
+    call->ops = &server_stream_ops;
+    call->open(conn, entry.max_response);
+    call->head_charge = frame.head.size;
+    call->context.deadline = deadline;
+    call->context.stop_token = call->stop.get_token();
+    call->context.metadata = metadata;
+    call->env = net::io_env{net::executor_ref{core->shard.executor}, call->context.stop_token, core->frame_allocator};
+    streams.insert(*call);
+    ++active;
+    ++core->stats.active_calls;
+    core->stats.request_bytes += call->head_charge;
+    last_admitted = id;
+    if (deadline != clock::time_point::max()) core->shard.schedule(*call, deadline);
+    invoke(*call);
+}
+
 void session::invoke(server_call &call) noexcept {
     bool failed = false;
     {
-        struct allocator_scope {
-            net::memory_resource *saved;
-            ~allocator_scope() { net::set_cached_frame_allocator(saved); }
-        } scope{net::get_cached_frame_allocator()};
-        net::set_cached_frame_allocator(core->frame_allocator);
+        allocator_scope scope{core->frame_allocator};
         try {
             call.task = call.method->handler->invoke(call.context, call.request, call.writer);
         } catch (...) {
@@ -435,12 +647,29 @@ void session::invoke(server_call &call) noexcept {
     net::safe_resume(call.task.await_suspend(call.done.handle(), &call.env));
 }
 
-void session::send_end(server_call &call, status_code const code) noexcept {
+void session::invoke(server_stream_call &call) noexcept {
+    bool failed = false;
+    {
+        allocator_scope scope{core->frame_allocator};
+        try {
+            call.task = call.kind == method_kind::unary ? unary_over_stream(call)
+                                                        : call.method->stream_handler->invoke(call.context, call.handle);
+        } catch (...) {
+            failed = true;
+        }
+    }
+    if (failed || !call.task) {
+        complete(call, status_code::internal);
+        return;
+    }
+    net::safe_resume(call.task.await_suspend(call.done.handle(), &call.env));
+}
+
+void session::send_end(std::uint32_t const stream, response_state const &state, status_code const code,
+                       bool const with_body) noexcept {
     bool const ok = code == status_code::ok;
-    std::size_t const body = ok ? call.response_size : 0;
-    // The wire carries a status message only with an error: ok keeps just the metadata.
-    std::size_t const skipped = ok && call.trailer_size != 0 ? call.trailer_metadata - 1 : 0;
-    std::size_t const head = call.trailer_size != 0 ? call.trailer_size - skipped : end_head_bytes;
+    std::size_t const body = ok && with_body ? state.response_size : 0;
+    std::size_t const head = state.end_head(ok);
     std::size_t const payload = head + body;
     std::uint8_t *frame = nullptr;
     try {
@@ -451,7 +680,7 @@ void session::send_end(server_call &call, status_code const code) noexcept {
     }
     wire::frame_header header{};
     header.length = static_cast<std::uint32_t>(payload);
-    header.stream_id = call.id;
+    header.stream_id = stream;
     header.type = wire::frame_type::end;
     header.head_length = static_cast<std::uint16_t>(head);
     header.aux = static_cast<std::uint32_t>(code);
@@ -459,22 +688,22 @@ void session::send_end(server_call &call, status_code const code) noexcept {
         conn.close();
         return;
     }
-    if (call.trailer_size == 0) {
-        frame[16] = frame[17] = 0;
-    } else if (skipped == 0) {
-        std::memcpy(frame + wire::header_size, call.trailer_block, head);
-    } else {
-        frame[16] = 0; // Empty message.
-        std::memcpy(frame + wire::header_size + 1, call.trailer_block + call.trailer_metadata, head - 1);
-    }
-    if (body != 0) std::memcpy(frame + wire::header_size + head, call.response_block, body);
+    state.write_end_head(frame + wire::header_size, ok);
+    if (body != 0) std::memcpy(frame + wire::header_size + head, state.response_block, body);
     conn.commit(wire::header_size + payload);
 }
 
+namespace {
+status_code checked(status_code const code) noexcept {
+    return static_cast<unsigned>(code) > static_cast<unsigned>(status_code::unauthenticated) ? status_code::internal
+                                                                                             : code;
+}
+} // namespace
+
 void session::complete(server_call &call, status_code code) noexcept {
     if (call.forced != status_code::ok) code = call.forced;
-    if (static_cast<unsigned>(code) > static_cast<unsigned>(status_code::unauthenticated)) code = status_code::internal;
-    if (!call.remote_cancelled && !call.detached && conn.state() != phase::closed) send_end(call, code);
+    code = checked(code);
+    if (!call.remote_cancelled && !call.detached && conn.state() != phase::closed) send_end(call.id, call, code, true);
     if (!call.detached) streams.erase(call.id);
     core->shard.unschedule(call);
     auto &stats = core->stats;
@@ -482,6 +711,26 @@ void session::complete(server_call &call, status_code code) noexcept {
     stats.request_bytes -= call.request_charge;
     stats.response_bytes -= call.method->charge();
     core->release_call(call);
+    --active;
+    if (goaway_sent && active == 0) conn.close_when_flushed();
+    release_if_done(); // May destroy this session.
+}
+
+void session::complete(server_stream_call &call, status_code code) noexcept {
+    if (call.forced != status_code::ok) code = call.forced;
+    code = checked(code);
+    // An ok end must honour the kind's single-message sides.
+    if (code == status_code::ok && ((call.sends_one() && call.sent != 1) ||
+                                    (call.receives_one() && (call.received != 1 || !call.remote_half))))
+        code = status_code::invalid_argument;
+    if (!call.remote_cancelled && !call.detached && conn.state() != phase::closed) send_end(call.id, call, code, false);
+    if (!call.detached) streams.erase(call.id);
+    core->shard.unschedule(call);
+    --core->stats.active_calls;
+    core->stats.request_bytes -= call.head_charge;
+    call.ended = true; // Held messages are freed without returning credit.
+    call.conn = nullptr;
+    delete &call;
     --active;
     if (goaway_sent && active == 0) conn.close_when_flushed();
     release_if_done(); // May destroy this session.
@@ -572,22 +821,19 @@ bool response_writer::assign(wire::bytes_view const bytes) noexcept {
 std::size_t response_writer::size() const noexcept { return call_ != nullptr ? call_->response_size : 0; }
 
 bool response_writer::set_trailer(wire::bytes_view const message, wire::metadata_list const metadata) noexcept {
-    auto *const call = call_;
-    if (call == nullptr || call->method == nullptr || call->method->max_trailer == 0) return false;
-    auto const limit = call->method->max_trailer;
-    if (call->trailer_block == nullptr) {
-        try {
-            call->trailer_block = call->core->shard.memory.allocate(limit);
-        } catch (std::bad_alloc const &) {
-            return false;
-        }
-    }
-    auto const encoded = wire::encode_end_head({message, metadata}, {call->trailer_block, limit});
-    std::array<std::uint8_t, 10> length{};
-    auto const prefix = wire::encode_varint(message.size, {length.data(), length.size()});
-    call->trailer_size = encoded.code == wire::error::none ? encoded.written : 0;
-    call->trailer_metadata = prefix.written + message.size;
-    return call->trailer_size != 0;
+    return call_ != nullptr && detail::set_trailer(*call_, message, metadata);
+}
+
+// ---- server_stream ----
+
+read_operation server_stream::read() noexcept { return detail::stream_access::read(call_); }
+
+write_operation server_stream::write(wire::bytes_view const message) noexcept {
+    return detail::stream_access::write(call_, message, false);
+}
+
+bool server_stream::set_trailer(wire::bytes_view const message, wire::metadata_list const metadata) noexcept {
+    return call_ != nullptr && detail::set_trailer(*call_, message, metadata);
 }
 
 // ---- server ----
