@@ -46,11 +46,11 @@ struct server_fixture {
         }
     }
     ~server_fixture() { server->close(); for (auto &gate : handler.gates) gate.signal(); context.run(); }
-    std::uint32_t request(std::size_t connection) {
+    std::uint32_t request(std::size_t connection, std::uint64_t timeout = 0) {
         auto id = ++ids[connection]; auto fresh = id == 1;
         std::vector<std::uint8_t> bytes(128);
         wire::bytes_view name = fresh ? wire::bytes_view{reinterpret_cast<std::uint8_t const *>("Echo"), 4} : wire::bytes_view{};
-        auto head = wire::encode_request_head({0, name, {}}, fresh, {bytes.data() + 16, 112});
+        auto head = wire::encode_request_head({timeout, name, {}}, fresh, {bytes.data() + 16, 112});
         CHECK(head.code == wire::error::none);
         CHECK(wire::encode_header({static_cast<std::uint32_t>(head.written + 1), id, wire::frame_type::request,
             static_cast<std::uint8_t>(wire::end_stream | (fresh ? wire::new_method : 0)),
@@ -164,8 +164,28 @@ void client_capacity() {
         CHECK(d.completions == 1 && d.result.code == rpc::status_code::ok); f.zero();
     }
 }
+void server_queue() {
+    auto config = options(); config.max_active_calls = 1;
+    config.max_queued_calls = 1; config.max_queued_bytes = 128;
+    server_fixture f{config};
+    f.request(0, 1000000); f.request(1, 1000000);
+    CHECK(f.handler.called == 1 && f.server->stats().active_calls == 1 && f.server->stats().queued_calls == 1);
+    auto rejected = f.request(0, 1000000); CHECK(f.rejected(0, rejected));
+    f.release(0);
+    CHECK(f.handler.called == 2 && f.server->stats().queued_calls == 0 && f.server->stats().active_calls == 1);
+    f.release(1);
+    f.request(0, 1000000); f.request(1, 1000);
+    f.context.run_for(std::chrono::milliseconds{5});
+    CHECK(f.handler.called == 3 && f.server->stats().queued_calls == 0);
+    f.release(2); f.zero();
+    server_fixture infinite{config}; infinite.request(0, 1000000);
+    auto refused = infinite.request(1); CHECK(infinite.rejected(1, refused)); infinite.zero();
+    server_fixture draining{config}; draining.request(0, 1000000); draining.request(1, 1000000);
+    draining.server->drain(); draining.context.poll(); draining.release(0);
+    CHECK(draining.handler.called == 1 && draining.server->stats().queued_calls == 0); draining.zero();
+}
 }
 int main() {
-    try { server_capacity(); client_capacity(); std::cout << "PASS independent connection/shared quotas, slow-reader tx retention, client pending/method limits\n"; }
+    try { server_capacity(); client_capacity(); server_queue(); std::cout << "PASS independent quotas, tx retention, deadline-bounded server queue and client limits\n"; }
     catch (std::exception const &error) { std::cerr << error.what() << '\n'; return 1; }
 }

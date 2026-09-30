@@ -325,6 +325,38 @@ void randomized_roundtrips() {
         CHECK(restored.value.head_length == h.head_length && restored.value.flags == h.flags);
     }
 }
+void extended_messages() {
+    std::array<std::uint8_t, 64> data{};
+    w::limits bounds{64, 1024, w::streaming | w::message_compression | w::explicit_rejection};
+    w::frame_header h{12, 1, w::frame_type::message, w::more, 9, 0};
+    CHECK(w::encode_header(h, writable(data), bounds).code == w::error::none);
+    CHECK(w::encode_message_descriptor({8, 8, 0}, {data.data() + 16, 9}, bounds).code == w::error::none);
+    CHECK(w::decode_frame({data.data(), 28}, bounds).code == w::error::none);
+    h = {1, 1, w::frame_type::message, w::compressed, 0, 0};
+    CHECK(w::encode_header(h, writable(data), bounds).code == w::error::invalid_flags);
+    h = {12, 1, w::frame_type::message, w::more, 9, 0};
+    CHECK(w::encode_header(h, writable(data), bounds).code == w::error::none);
+    CHECK(w::decode_frame({data.data(), 28}).code == w::error::unsupported_feature);
+    data[9] = 0; CHECK(w::decode_frame({data.data(), 28}, bounds).code == w::error::invalid_length);
+    data[9] = w::compressed | w::more;
+    CHECK(w::decode_frame({data.data(), 28}, bounds).code == w::error::invalid_flags);
+    CHECK(w::encode_message_descriptor({8, 32, 1}, {data.data() + 16, 9}, bounds).code == w::error::none);
+    CHECK(w::decode_frame({data.data(), 28}, bounds).code == w::error::none);
+    CHECK(w::encode_message_descriptor({8, 1025, 1}, {data.data() + 16, 9}, bounds).code == w::error::message_too_large);
+    CHECK(w::encode_message_descriptor({8, 7, 0}, {data.data() + 16, 9}, bounds).code == w::error::invalid_head);
+    h = {0, 1, w::frame_type::message, w::end_stream, 0, 0};
+    CHECK(w::encode_header(h, writable(data), bounds).code == w::error::none);
+    CHECK(w::decode_frame({data.data(), 16}, bounds).code == w::error::none);
+    h.flags |= w::more; CHECK(w::encode_header(h, writable(data), bounds).code == w::error::invalid_flags);
+    h = {2, 1, w::frame_type::end, w::more, 2, 0};
+    CHECK(w::encode_header(h, writable(data), bounds).code == w::error::invalid_flags);
+    h = {0, 1, w::frame_type::window_update, 0, 0, 8};
+    CHECK(w::encode_header(h, writable(data), bounds).code == w::error::none);
+    h.aux = 0; CHECK(w::encode_header(h, writable(data), bounds).code == w::error::invalid_aux);
+    h = {10, 1, w::frame_type::request, w::new_method, 10, 1};
+    CHECK(w::encode_header(h, writable(data), bounds).code == w::error::none);
+    ++h.length; CHECK(w::encode_header(h, writable(data), bounds).code == w::error::invalid_length);
+}
 
 } // namespace
 
@@ -336,7 +368,7 @@ int main() {
         {"control frames", control_frames}, {"settings", settings_contract}, {"GOAWAY UTF-8", goaway_utf8},
         {"request head", request_head_contract}, {"end head", end_head_contract},
         {"hostile lengths", hostile_head_lengths}, {"storage guards", invalid_storage_and_guards},
-        {"randomized roundtrips", randomized_roundtrips}};
+        {"randomized roundtrips", randomized_roundtrips}, {"negotiated message grammar", extended_messages}};
     try {
         for (auto const &test : cases) { test.run(); std::cout << "PASS " << test.name << '\n'; }
     } catch (std::exception const &error) {

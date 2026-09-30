@@ -160,6 +160,17 @@ void control_pool_exhaustion() {
     f.pipe->feed(control(wire::frame_type::ping)); f.context.poll();
     CHECK(f.pipe->closed && f.service.called == 0); f.close();
 }
+void keepalive_waits_for_sent_ping() {
+    auto options = config(); options.connection.keepalive_interval = std::chrono::milliseconds{1};
+    options.connection.keepalive_timeout = std::chrono::milliseconds{2};
+    fixture f{options}; f.start(); f.pipe->block_writes = true;
+    f.context.run_for(std::chrono::milliseconds{10});
+    CHECK(!f.pipe->closed && f.pipe->writer && f.pipe->output.empty());
+    f.pipe->finish_write(65536); f.context.poll();
+    auto ping = wire::decode_frame({f.pipe->output.data(), f.pipe->output.size()});
+    CHECK(ping.code == wire::error::none && ping.value.header.type == wire::frame_type::ping);
+    f.context.run_for(std::chrono::milliseconds{5}); CHECK(f.pipe->closed); f.close();
+}
 
 void deadline_owner_lifetime() {
     fixture f; f.start(); f.service.blocked = true;
@@ -312,6 +323,7 @@ int main() {
         split_and_coalesced_frames(); std::cout << "PASS bytewise and coalesced frames\n";
         protocol_errors(); std::cout << "PASS connection protocol errors\n";
         control_pool_exhaustion(); std::cout << "PASS independent control pool exhaustion\n";
+        keepalive_waits_for_sent_ping(); std::cout << "PASS keepalive timeout starts after PING write\n";
         deadline_owner_lifetime(); std::cout << "PASS deadline owner outlives I/O and facade\n";
         connection_capacity_lifetime(); std::cout << "PASS connection capacity retained until physical release\n";
         handshake_exception_cleanup(); std::cout << "PASS handshake exception cleanup\n";

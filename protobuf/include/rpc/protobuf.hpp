@@ -52,10 +52,16 @@ class message_storage<Request, Response, typename std::enable_if<
     std::is_base_of<google::protobuf::MessageLite, Request>::value &&
     std::is_base_of<google::protobuf::MessageLite, Response>::value>::type> {
 public:
+    static constexpr bool reusable = true;
     message_storage() : request_(google::protobuf::Arena::CreateMessage<Request>(&arena_.get())),
                         response_(google::protobuf::Arena::CreateMessage<Response>(&arena_.get())) {}
     Request &request() noexcept { return *request_; }
     Response &response() noexcept { return *response_; }
+    void reset() {
+        arena_.get().Reset();
+        request_ = google::protobuf::Arena::CreateMessage<Request>(&arena_.get());
+        response_ = google::protobuf::Arena::CreateMessage<Response>(&arena_.get());
+    }
 private:
     call_arena arena_{};
     Request *request_;

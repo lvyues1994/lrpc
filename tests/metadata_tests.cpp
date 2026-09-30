@@ -30,14 +30,42 @@ struct metadata {
     w::metadata_list view() const { return {entries.data(), entries.size()}; }
 };
 
-std::vector<std::uint8_t> end(std::uint32_t id, w::metadata_list values, rpc::status_code code = rpc::status_code::ok) {
+std::vector<std::uint8_t> end(std::uint32_t id, w::metadata_list values, rpc::status_code code = rpc::status_code::ok,
+                              w::bytes_view message = {}) {
     std::vector<std::uint8_t> data(256);
-    auto encoded = w::encode_end_head({{}, values}, {data.data() + 16, data.size() - 16});
+    auto encoded = w::encode_end_head({message, values}, {data.data() + 16, data.size() - 16});
     CHECK(encoded.code == w::error::none);
     auto const body = code == rpc::status_code::ok ? 1U : 0U;
     CHECK(w::encode_header({static_cast<std::uint32_t>(encoded.written + body), id, w::frame_type::end,
         0, static_cast<std::uint16_t>(encoded.written), static_cast<std::uint32_t>(code)}, {data.data(), 16}).code == w::error::none);
     data[16 + encoded.written] = 42; data.resize(16 + encoded.written + body); return data;
+}
+
+void status_messages() {
+    metadata values; std::array<std::uint8_t, 256> storage{};
+    rpc::metadata_writer writer{{storage.data(), storage.size()}};
+    std::string message(130, 'x'); message[3] = '\0';
+    CHECK(writer.assign(values.view()) && writer.assign_message(bytes(message)));
+    auto decoded = w::decode_end_head({storage.data(), writer.size()});
+    CHECK(decoded.code == w::error::none && text(decoded.value.message) == message);
+    check_metadata(decoded.value.metadata);
+    CHECK(writer.assign({}) && writer.assign(values.view()));
+    CHECK(writer.assign_message({}) && writer.assign_message(bytes(message)));
+    decoded = w::decode_end_head({storage.data(), writer.size()});
+    CHECK(text(decoded.value.message) == message); check_metadata(decoded.value.metadata);
+    CHECK(!writer.assign_message(bytes(std::string(300, 'x'))) && writer.overflowed());
+    CHECK(!writer.assign_message({}));
+
+    test_client::call a; test_client::fixture f;
+    f.start(a); f.context.poll();
+    f.pipe->feed(end(1, {}, rpc::status_code::permission_denied, bytes(message))); f.context.poll();
+    CHECK(a.completions == 1 && a.result.code == rpc::status_code::permission_denied && a.result.message == message);
+    for (unsigned i = 0; i < 50; ++i) f.pipe->feed(test_client::reply(1));
+    f.context.poll(); CHECK(a.result.message == message); f.zero();
+    std::error_code ec = rpc::status_code::cancelled;
+    CHECK(ec.category() == rpc::status_category() && ec == net::cond::canceled);
+    ec = rpc::status_code::deadline_exceeded; CHECK(ec == net::cond::timeout);
+    ec = rpc::status_code::permission_denied; CHECK(ec.message() == "permission_denied");
 }
 
 void client_metadata() {
@@ -110,6 +138,7 @@ struct metadata_handler final : rpc::method_handler {
     unsigned calls = 0;
     bool overflow_body = false;
     rpc::status_code result = rpc::status_code::ok;
+    std::string message{};
 };
 auto respond(metadata_handler *self, rpc::server_context *context, w::bytes_view request, rpc::response_writer *writer)
     CO2_BEG(net::task<rpc::status_code>, (self, context, request, writer)) {
@@ -120,7 +149,7 @@ auto respond(metadata_handler *self, rpc::server_context *context, w::bytes_view
     }
     if (self->overflow_body) writer->commit(writer->buffer().size + 1);
     else writer->assign(request);
-    CO2_RETURN(self->result);
+    CO2_RETURN(rpc::set_status(*context, {self->result, self->message}));
 }
 CO2_END
 net::task<rpc::status_code> metadata_handler::invoke(rpc::server_context &ctx, w::bytes_view req, rpc::response_writer &out) {
@@ -137,8 +166,10 @@ std::vector<std::uint8_t> request(metadata const &values) {
     data[16 + h.written] = 42; data.resize(17 + h.written); return data;
 }
 
-void server_metadata(std::size_t head_capacity, rpc::status_code status, bool overflow_body = false, bool delayed_close = false) {
+void server_metadata(std::size_t head_capacity, rpc::status_code status, bool overflow_body = false, bool delayed_close = false,
+                     std::string message = {}) {
     metadata values; metadata_handler handler; handler.result = status; handler.overflow_body = overflow_body;
+    handler.message = message;
     net::io_context context{net::default_backend, net::single_thread_hint};
     auto server = rpc::make_server(context, {{"Echo", 16, &handler, head_capacity}});
     auto pipe = std::make_shared<manual_pipe>();
@@ -164,12 +195,15 @@ void server_metadata(std::size_t head_capacity, rpc::status_code status, bool ov
         while (pipe->writer) { pipe->finish_write(10000); context.poll(); }
         auto result = w::decode_frame({pipe->output.data(), pipe->output.size()}); CHECK(result.code == w::error::none);
         auto head = w::decode_end_head(result.value.head); CHECK(head.code == w::error::none);
-        if (head_capacity == 2 || overflow_body) {
+        if (head_capacity == 2 || overflow_body || message.size() > head_capacity) {
             CHECK(result.value.header.aux == static_cast<unsigned>(rpc::status_code::internal));
             CHECK(result.value.body.size == 0 && head.value.metadata.count == 0);
         } else {
-            CHECK(result.value.header.aux == static_cast<unsigned>(status)); check_metadata(head.value.metadata);
-            CHECK(result.value.body.size == (status == rpc::status_code::ok ? 1U : 0U));
+            auto const invalid_ok = status == rpc::status_code::ok && !message.empty();
+            CHECK(text(head.value.message) == (invalid_ok ? "" : message));
+            CHECK(result.value.header.aux == static_cast<unsigned>(invalid_ok ? rpc::status_code::internal : status));
+            check_metadata(head.value.metadata);
+            CHECK(result.value.body.size == (status == rpc::status_code::ok && !invalid_ok ? 1U : 0U));
             if (result.value.body.size) CHECK(result.value.body.data[0] == 42);
         }
         server->close(); context.run();
@@ -194,11 +228,14 @@ void binding_limits() {
 
 int main() {
     try {
-        client_metadata(); cancelled_definition(); client_limits(); binding_limits();
+        client_metadata(); cancelled_definition(); client_limits(); binding_limits(); status_messages();
         server_metadata(64, rpc::status_code::ok); server_metadata(64, rpc::status_code::permission_denied);
         server_metadata(2, rpc::status_code::ok); server_metadata(64, rpc::status_code::ok, true);
         server_metadata(64, rpc::status_code::ok, false, true);
         server_metadata(1008, rpc::status_code::ok); server_metadata(1009, rpc::status_code::ok);
+        server_metadata(64, rpc::status_code::permission_denied, false, false, "denied");
+        server_metadata(64, rpc::status_code::ok, false, false, "invalid ok");
+        server_metadata(64, rpc::status_code::permission_denied, false, false, std::string(100, 'x'));
         std::cout << "PASS metadata lifetime, method publication, errors and budgets\n";
     } catch (std::exception const &error) { std::cerr << error.what() << '\n'; return 1; }
 }

@@ -9,12 +9,15 @@
 | --- | --- |
 | `lrpc::wire` | 无分配的帧和 head 编解码、协议校验；视图借用输入，编码输入不得与输出重叠 |
 | `lrpc::codec` | 可特化的消息 codec 及擦除类型的编解码入口，不依赖 protobuf |
-| `lrpc::unary` | 单分片 TCP、原始字节与类型化调用、SETTINGS 握手、方法名驻留、写合并、取消与截止、双向 metadata、过载拒绝及 GOAWAY 排空 |
+| `lrpc::message` | 拥有型分段 byte_buffer、物理容量预算及可选 zstd/LZ4 |
+| `lrpc::unary` | 单分片 TCP、原始字节与类型化调用、固定调用槽、共享精确截止、方法绑定、server_builder、状态说明、双向 metadata、过载拒绝及 GOAWAY 排空 |
+| `lrpc::runtime` | 固定分片线程、连接池、静态/DNS 解析、重连退避、平衡、有限排队、重试、interceptor、追踪及指标导出 |
 | `lrpc::protobuf` | 可选的 protobuf codec、类型化服务适配器及每调用 Arena，带 2 KiB 内联初始块 |
-| `protoc-gen-rpc` | 生成客户端 Stub、服务端接口、方法描述符、绑定和每方法容量配置 |
+| `protoc-gen-rpc` | 生成冷绑定的客户端 Stub、服务端接口、方法描述符、builder 注册和每方法容量配置 |
 
-公开接口见 [unary.hpp](unary/include/rpc/unary.hpp) 和 [typed.hpp](unary/include/rpc/typed.hpp)。
-完整设计与当前实现边界见 [设计稿](docs/rpc-design.md)，其中 §17.1 记录已经落地的部分。
+流式 profile 支持上传流、下载流、双向流、MESSAGE 分片、窗口背压、半关闭和跨分片调用；生成器覆盖四种方法。
+公开接口见 [unary.hpp](unary/include/rpc/unary.hpp)、[stream.hpp](unary/include/rpc/stream.hpp) 和 [runtime.hpp](runtime/include/rpc/runtime.hpp)。
+完整设计与当前实现边界见 [设计稿](docs/rpc-design.md)，其中 §17.1–17.2 记录两种连接 profile。
 
 ## 构建与运行
 
@@ -76,24 +79,31 @@ ctest --preset protobuf
 ## 调用与资源约定
 
 - 原始字节和自定义类型接口链接 `lrpc::unary`；protobuf 接口链接 `lrpc::protobuf` 或生成的协议 target。
-  先等待 `connect()` 成功，再调用 RPC；没有隐式连接、重连或自动重试。
+  直接 client 先等待 `connect()` 成功再调用；连接池、按需连接与重试使用 `lrpc::runtime` 的 channel。
 - 请求、回复及请求 metadata 的借用存储须保活到调用完成。生成的 binding 持有适配器，用户 service 则须保活到服务端工作排空。
-- 每方法必须显式设置 `max_response_bytes`；`0` 表示空响应。服务端执行前预留响应存储，handler 超限写入返回 `internal`。
+- 公开调用保留 `net::task<call_result>`。生成的非空 Stub 构造时批量绑定方法，可能分配或抛异常；
+  手写调用可用 `client::bind(descriptor)` 获取只适用于该 client 的 handle，注册上限 `max_registered_methods` 默认 4096。
+- 每方法必须显式设置 `max_response_bytes`；`0` 表示空响应。一元调用在业务执行前预留响应存储；流式响应在 write 时取得预算，超限拒绝。
 - 请求 metadata 由 `call_options.metadata` 发送；响应由 `server_context.response_metadata.assign(...)` 立即复制。
   发送响应 metadata 时需增大默认值为 2 的 `max_response_head_bytes`；客户端通过 `call_options.response_metadata` 提供接收缓冲，
   在 `call_result.response_metadata` 中取得视图。默认丢弃，容量不足返回 `resource_exhausted`。
+- `call_result.code` 是状态码，`.message` 拥有错误说明。生成服务可返回 `rpc::set_status(context, {code, message})`；
+  说明与 metadata 共用 head 上限，OK 不允许说明。`std::error_code ec = result.code` 支持 net 的取消/超时条件判断。
 - `call_options.deadline` 是绝对截止，`timeout` 是额外的相对上限，两者取较早值。下游调用传入上游 `server_context.deadline` 即可继承截止。
-- 调用继承父 task 的 stop token，允许其它线程请求停止。其余 API，包括析构，均在所属 `io_context` 分片线程执行。
+- 调用继承父 task 的 stop token，允许其它线程请求停止。单分片 API，包括析构，在所属 `io_context` 执行；
+  runtime facade 支持外部执行器调用，`call_sync` 仅供外部线程使用。
 - `drain()` 停止服务端准入并完成已接纳调用；`close()` 请求取消。关闭后仍须运行事件循环消费完成事件，再销毁 context。
   `drain()` 没有自动宽限期，忽略取消且一直不结束的 handler 会继续持有资源。
 
-请求、响应和控制帧使用固定池，预算按整块容量加描述符计费，同时受分片和连接额度限制；响应占额持续到写完成。
+默认单帧一元 profile 的请求、响应和控制帧使用固定池，预算按整块容量加描述符计费，同时受分片和连接额度限制；响应占额持续到写完成。
 响应池块大小取所有方法中最大的 `16 + max_response_head_bytes + max_response_bytes`，小响应也按该整块收费。
-`stats().storage_bytes` 包含空闲池块，不包含接收缓冲、方法表、调用对象、Arena、分配器开销及传输层内存，不能当作进程总内存。
+该路径的 `stats().storage_bytes` 包含空闲池块和显式 Arena 固定缓存；流式 profile 另含拥有型 payload、接收窗口及压缩/source 工作区。
+两者均不覆盖方法表、调用对象、活动 Arena 扩展块、分配器开销及全部传输层内存，不能当作进程总内存。
 
 `connection_options.receive_buffer_bytes` 可独立设置每连接接收窗口，允许一次读取容纳多帧。
 默认 `0` 使用 `max_frame_size + 16` 字节，显式值介于该下限与 `16 MiB + 16` 之间；增大窗口会增加每连接固定内存。
-公共结构和虚接口已有扩展，库与调用方需一起重新编译。
+公共结构和虚接口已有扩展，库与调用方需一起重新编译；自定义 client 派生实现需补新增 bind/handle 入口。
+调用槽、worker 与截止节点的生命周期和 API 选择见 [运行时升级](docs/runtime-upgrade.md)。
 
 ## 测试与诊断
 
@@ -107,7 +117,9 @@ ctest --preset protobuf
 
 切换构建目录时需重新传入依赖路径。测试覆盖协议边界、部分读写、粘包、缓冲寿命、预算回收、并发取消、超时、过载、
 分配失败及生成器负例；TCP 与取消压力按 epoll/poll/select/io_uring 运行，不可用后端明确跳过。
-protobuf Debug、Release 和 ASan/UBSan 各 23 项测试通过，关闭 protobuf 后 17 项通过；发行版 protobuf 二进制本身未插桩。
+本阶段 Debug 30 项、protobuf Release 与 ASan/UBSan/LSan 各 40 项、TSan 28 项通过；覆盖四个网络后端且本机无跳过。
+新增检查包含线程启动回滚、有限排队/重试、跨分片调用、四种生成接口、分片消息、压缩、外线程取消及晚释放 buffer。
+发行版 protobuf 二进制本身未插桩；TSan 排除全局 new 故障注入及 pthread_create 拦截测试。
 
 运行协议模糊测试：
 
@@ -123,8 +135,15 @@ cmake --build --preset fuzz
 包含闭环、开放负载、逐请求延迟、分配栈与发送队列诊断。
 结果依次记录在 [首轮实测](benchmarks/results/2026-09-27.md)、[P0 验证](benchmarks/results/2026-09-27-p0.md)、
 [开放负载复测](benchmarks/results/2026-09-27-open-load.md) 和 [调度诊断](benchmarks/results/2026-09-27-scheduler.md)。
-严格性能验收仍未通过，不能将诊断运行当作达标结果；protobuf 路径的 p99 尚未验收。
+本轮字节/protobuf 的新旧实现配对数据见 [运行时实测](benchmarks/results/2026-09-30-runtime.md)。
+后续缓存及 channel/runtime 入口的比较见 [升级阶段实测](benchmarks/results/2026-09-30-upgrade.md)。
+严格性能验收仍未完成，不能将短轮或诊断运行当作持续负载达标结果。
 
-当前仍使用每调用定时器、`run_async` 和动态调用对象，尚未达到设计中的分配目标；Arena 也可继续向堆分配。
-调用对象池、时间轮、多分片、有限准入排队和流式 RPC 尚未实现；协议当前仅接受单帧、无压缩的一元调用及控制帧。
+默认单帧一元路径的调用槽和流号索引已固定容量化，服务端复用 wrapper worker；各 profile 共用精确截止调度器。
+公开 task、用户 handler/typed adapter 帧、StopState 和可扩容 Arena 仍有分配。
+默认连接仍使用单帧一元路径。流式/大消息须在客户端配置 `receive.features |= wire::streaming` 和正数 `initial_stream_window`；
+带流式 binding 的服务端自动启用该 profile。压缩需 `-DLRPC_ENABLE_COMPRESSION=ON`、zstd/LZ4 开发包及双方 SETTINGS 协商；默认关闭。
+开启 streaming 的客户端对未协商该 profile 的旧服务端返回 `unimplemented`；新服务端支持旧客户端的小消息一元帧。
+`receive_source` 将后端缓冲复制到 RPC 拥有的存储后归还；net 没有可分离缓冲租约，本实现不宣称端到端内核零拷贝。
+运行时与流式用法、预算及关闭契约见 [升级说明](docs/runtime-upgrade.md)。
 依赖存在已复现但未修改的 [net 定时器扩容 OOM 限制](docs/net-timer-oom.md)，常规测试通过不表示该故障可恢复。

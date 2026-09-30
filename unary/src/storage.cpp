@@ -9,14 +9,40 @@
 namespace rpc {
 
 metadata_writer::metadata_writer(wire::mutable_bytes_view storage) noexcept : storage_(storage) {
+    if (storage_.size != 0 && storage_.data != nullptr) storage_.data[0] = 0;
     assign({});
 }
 bool metadata_writer::assign(wire::metadata_list entries) noexcept {
     if (overflowed_) return false;
-    auto const result = wire::encode_end_head({{}, entries}, storage_);
+    if (storage_.size < message_end_ || storage_.data == nullptr) { overflowed_ = true; return false; }
+    auto const result = wire::encode_metadata(entries, {storage_.data + message_end_, storage_.size - message_end_});
     if (result.code != wire::error::none) { overflowed_ = true; return false; }
-    size_ = result.written;
+    size_ = message_end_ + result.written;
     return true;
+}
+bool metadata_writer::assign_message(wire::bytes_view message) noexcept {
+    if (overflowed_) return false;
+    if (message.size != 0 && message.data == nullptr) { overflowed_ = true; return false; }
+    std::uint8_t prefix[10]{};
+    auto const encoded = wire::encode_varint(message.size, {prefix, sizeof(prefix)});
+    auto const tail = size_ - message_end_;
+    if (message.size > storage_.size || encoded.written > storage_.size - message.size ||
+        tail > storage_.size - message.size - encoded.written || storage_.data == nullptr) {
+        overflowed_ = true; return false;
+    }
+    auto const end = encoded.written + message.size;
+    std::memmove(storage_.data + end, storage_.data + message_end_, tail);
+    if (message.size != 0) std::memcpy(storage_.data + encoded.written, message.data, message.size);
+    std::memcpy(storage_.data, prefix, encoded.written);
+    message_end_ = end; size_ = end + tail;
+    return true;
+}
+bool metadata_writer::has_message() const noexcept { return message_end_ != 1; }
+status_code set_status(server_context &context, status const &result) noexcept {
+    if (result.code == status_code::ok && !result.message.empty()) return status_code::internal;
+    if (!context.response_metadata.assign_message({reinterpret_cast<std::uint8_t const *>(result.message.data()), result.message.size()}))
+        return status_code::internal;
+    return result.code;
 }
 std::size_t metadata_writer::size() const noexcept { return size_; }
 bool metadata_writer::overflowed() const noexcept { return overflowed_; }
@@ -91,7 +117,7 @@ void block_pool::release(block &value) noexcept {
     value.budget->used -= charge();
     value.budget = nullptr;
     used_ -= charge();
-    value.request.reset();
+    value.request = {};
     value.next = free_;
     free_ = &value;
 }

@@ -1,4 +1,6 @@
 #include "client_fixture.hpp"
+#include "../unary/src/runtime.hpp"
+#include <rpc/typed.hpp>
 #include <cstdlib>
 #include <iostream>
 #include <new>
@@ -6,9 +8,12 @@
 namespace {
 std::size_t fail_after = 0;
 std::size_t fail_size = 0;
+std::size_t fail_size_after = 0;
 bool injected = false;
 void *allocate(std::size_t size) {
-    if (fail_size && size == fail_size) { fail_size = 0; injected = true; throw std::bad_alloc{}; }
+    if (fail_size && size == fail_size && (!fail_size_after || --fail_size_after == 0)) {
+        fail_size = 0; injected = true; throw std::bad_alloc{};
+    }
     if (fail_after && --fail_after == 0) { injected = true; throw std::bad_alloc{}; }
     if (auto *value = std::malloc(size ? size : 1)) return value;
     throw std::bad_alloc{};
@@ -117,6 +122,128 @@ void receive_window_failure() {
     CHECK(!pipe->closed && server->stats().connections == 1);
     server->close(); context.run(); CHECK(server->stats().connections == 0 && context.run() == 0);
 }
+
+rpc::client_options small_client() {
+    rpc::client_options options{};
+    options.connection.receive.max_frame_size = 1024;
+    options.connection.receive.max_message_size = 1024;
+    options.connection.receive.max_concurrent_streams = 2;
+    options.connection.receive.max_method_ids = 2;
+    options.request_bytes = 32768; options.control_bytes = 4096;
+    options.max_registered_methods = 2;
+    return options;
+}
+
+void construction_rollback() {
+    net::io_context context{net::default_backend, net::single_thread_hint};
+    auto anchor = rpc::make_client(context, small_client());
+    auto scheduler = rpc::detail::shard_deadlines(context);
+    auto const capacity = rpc::detail::deadline_capacity(*scheduler);
+    unsigned failures = 0;
+    for (std::size_t nth = 1; nth <= 48; ++nth) {
+        std::unique_ptr<rpc::client> candidate;
+        injected = false; fail_after = nth;
+        try { candidate = rpc::make_client(context, small_client()); }
+        catch (std::bad_alloc const &) { ++failures; }
+        fail_after = 0;
+        if (candidate) { candidate->close(); candidate.reset(); }
+        CHECK(rpc::detail::deadline_capacity(*scheduler) == capacity);
+        CHECK(context.run() == 0);
+    }
+    CHECK(failures != 0);
+}
+
+void registry_rollback() {
+    rpc::codec_ops const operations{
+        [](void const *) -> std::size_t { return 0; },
+        [](void const *, rpc::wire::mutable_bytes_view) { return true; },
+        [](rpc::wire::bytes_view, void *) { return true; }};
+    rpc::method_descriptor const first[] = {
+        {"A", rpc::method_kind::unary, rpc::idempotency::unknown, &operations, &operations},
+        {"B", rpc::method_kind::unary, rpc::idempotency::unknown, &operations, &operations}};
+    rpc::method_descriptor const replacement[] = {
+        {"C", rpc::method_kind::unary, rpc::idempotency::unknown, &operations, &operations},
+        {"D", rpc::method_kind::unary, rpc::idempotency::unknown, &operations, &operations}};
+    unsigned failures = 0;
+    for (std::size_t nth = 1; nth <= 12; ++nth) {
+        net::io_context context{net::default_backend, net::single_thread_hint};
+        auto client = rpc::make_client(context, small_client());
+        bool failed = false; injected = false; fail_after = nth;
+        try { CHECK(client->bind({"first", first, 2}).size() == 2); }
+        catch (std::bad_alloc const &) { failed = true; ++failures; }
+        fail_after = 0;
+        if (failed) CHECK(client->bind({"replacement", replacement, 2}).size() == 2);
+        CHECK(context.run() == 0);
+    }
+    CHECK(failures != 0);
+}
+
+void listener_start_rollback() {
+    unsigned failures = 0;
+    // Fail each cold driver/worker/accept frame. Keep the facade alive while
+    // draining so destruction cannot hide a failed-start work-count leak.
+    for (std::size_t nth = 1; nth <= 8; ++nth) {
+        failing_frames frames;
+        net::io_context context{net::default_backend, net::single_thread_hint};
+        context.set_frame_allocator(&frames);
+        rpc::server_options options{}; options.max_active_calls = 2;
+        auto server = rpc::make_server(context, {}, options);
+        bool failed = false; frames.remaining = nth;
+        try { server->listen({net::ip::address_v4::loopback(), 0}); }
+        catch (std::bad_alloc const &) { failed = true; ++failures; }
+        frames.remaining = 0;
+        if (!failed) server->close();
+        context.run();
+        CHECK(server->stats().connections == 0 && server->stats().active_calls == 0);
+        CHECK(frames.live == 0 && context.run() == 0);
+    }
+    CHECK(failures != 0);
+}
+
+void status_copy_failure() {
+    std::string const message(200, 'x');
+    std::vector<std::uint8_t> packet(256);
+    auto head = rpc::wire::encode_end_head({{reinterpret_cast<std::uint8_t const *>(message.data()), message.size()}, {}},
+        {packet.data() + 16, packet.size() - 16});
+    CHECK(head.code == rpc::wire::error::none);
+    CHECK(rpc::wire::encode_header({static_cast<std::uint32_t>(head.written), 1, rpc::wire::frame_type::end, 0,
+        static_cast<std::uint16_t>(head.written), static_cast<std::uint32_t>(rpc::status_code::permission_denied)},
+        {packet.data(), 16}).code == rpc::wire::error::none);
+    packet.resize(16 + head.written);
+    for (std::size_t nth : {std::size_t{1}, std::size_t{2}}) {
+        test_client::fixture f; rpc::call_result result; unsigned completed = 0; std::exception_ptr error;
+        net::run_async(f.context.get_executor(), [&](rpc::call_result value) {
+            result = std::move(value); ++completed;
+        },
+            [&](std::exception_ptr value) { error = value; })([&] { return f.client->call("Echo", {}, {}); });
+        f.context.poll(); f.pipe->feed(packet);
+        // libstdc++'s owning string copy requests text length + its terminator.
+        // Target that allocation, independently of transport read rearming.
+        injected = false; fail_size = message.size() + 1; fail_size_after = nth;
+        f.context.poll(); fail_size = 0; fail_size_after = 0;
+        CHECK(completed == 1 && !error);
+        if (nth == 1) CHECK(injected && result.code == rpc::status_code::resource_exhausted && result.message.empty());
+        else {
+            CHECK(!injected && result.code == rpc::status_code::permission_denied && result.message == message);
+        }
+        f.zero();
+    }
+}
+
+void builder_retry() {
+    unsigned failures = 0;
+    for (std::size_t nth = 1; nth <= 16; ++nth) {
+        net::io_context context{net::default_backend, net::single_thread_hint};
+        rpc::server_options options{}; options.max_active_calls = 2;
+        rpc::server_builder builder{context, options}; std::unique_ptr<rpc::server> server;
+        injected = false; fail_after = nth;
+        try { server = builder.build(); } catch (std::bad_alloc const &) { ++failures; }
+        fail_after = 0;
+        if (!server) server = builder.build();
+        CHECK(server && context.run() == 0); server->close();
+    }
+    CHECK(failures != 0);
+}
 }
 
 int main(int argc, char **argv) {
@@ -147,8 +274,12 @@ int main(int argc, char **argv) {
             }
             f.zero();
         }
-        CHECK(exercised >= 4 && recovered >= 4);
+        // Count actual reachable failures, rather than requiring the allocation
+        // topology of the former per-call node/timer implementation.
+        CHECK(exercised != 0 && recovered == exercised);
         auto launches = launch_failures(); auto handshakes = handshake_failures(); receive_window_failure();
+        construction_rollback(); registry_rollback(); listener_start_rollback();
+        status_copy_failure(); builder_retry();
         std::cout << "PASS " << exercised << " admission failure points, " << recovered << " recoveries, "
                   << launches << " task launch failures, " << handshakes << " handshake/I/O frame failures, receive-window OOM recovery\n";
     } catch (std::exception const &error) { fail_after = 0; fail_size = 0; std::cerr << error.what() << '\n'; return 1; }

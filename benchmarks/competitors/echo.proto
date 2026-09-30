@@ -1,0 +1,5 @@
+syntax = "proto3";
+package comparison;
+option cc_generic_services = true;
+message Payload { bytes payload = 1; }
+service EchoService { rpc Echo(Payload) returns (Payload); }

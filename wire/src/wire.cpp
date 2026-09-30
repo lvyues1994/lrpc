@@ -84,6 +84,7 @@ private:
 // the caller supplies a larger buffer. Partial output is discarded on failure.
 class writer {
 public:
+    writer() noexcept : output_{nullptr, max_head_size}, counting_(true) {}
     explicit writer(mutable_bytes_view output) noexcept : output_(output) {
         if (!valid(output)) code_ = error::invalid_argument;
     }
@@ -93,7 +94,7 @@ public:
         if (!valid(bytes)) { code_ = error::invalid_argument; return; }
         if (bytes.size > max_head_size - offset_) { code_ = error::invalid_head; return; }
         if (bytes.size > output_.size - offset_) { code_ = error::output_too_small; return; }
-        if (bytes.size != 0) std::memcpy(output_.data + offset_, bytes.data, bytes.size);
+        if (!counting_ && bytes.size != 0) std::memcpy(output_.data + offset_, bytes.data, bytes.size);
         offset_ += bytes.size;
     }
 
@@ -110,6 +111,7 @@ private:
     mutable_bytes_view output_{};
     std::size_t offset_ = 0;
     error code_ = error::none;
+    bool counting_ = false;
 };
 
 metadata_view read_metadata(reader &input) noexcept {
@@ -140,20 +142,38 @@ void write_metadata(writer &output, metadata_list values) noexcept {
 error validate_header(frame_header const &h, limits bounds) noexcept {
     auto const type = static_cast<std::uint8_t>(h.type);
     if (type < 1 || type > 9) return error::invalid_type;
-    if ((h.flags & 0xf0U) != 0) return error::invalid_flags;
+    if ((h.flags & 0xe0U) != 0) return error::invalid_flags;
+    if ((h.flags & not_executed) != 0 &&
+        ((bounds.features & explicit_rejection) == 0 || h.type != frame_type::end))
+        return error::invalid_flags;
     if (h.head_length > h.length) return error::invalid_length;
     if (h.length > bounds.max_frame_size) return error::frame_too_large;
     auto const connection_frame = h.type == frame_type::settings || h.type == frame_type::ping ||
                                   h.type == frame_type::pong || h.type == frame_type::goaway;
     if (connection_frame ? h.stream_id != 0 : (h.stream_id == 0 || h.stream_id > max_stream_id))
         return error::invalid_stream_id;
-    if ((h.flags & (compressed | more)) != 0 || h.type == frame_type::message ||
-        h.type == frame_type::window_update) return error::unsupported_feature;
+    if (((h.flags & more) != 0 || h.type == frame_type::message || h.type == frame_type::window_update) &&
+        (bounds.features & streaming) == 0) return error::unsupported_feature;
+    if ((h.flags & compressed) != 0 && (bounds.features & message_compression) == 0) return error::unsupported_feature;
     if (h.type == frame_type::request) {
-        if ((h.flags & end_stream) == 0) return error::unsupported_feature;
+        if ((h.flags & end_stream) == 0) {
+            if ((bounds.features & streaming) == 0) return error::unsupported_feature;
+            if (h.length != h.head_length) return error::invalid_length;
+        }
+        if ((h.flags & ~(end_stream | new_method)) != 0) return error::invalid_flags;
         if (h.aux == 0) return error::invalid_aux;
         if (h.head_length < 9) return error::invalid_head;
-    } else if (h.flags != 0) return error::invalid_flags;
+    } else if (h.type == frame_type::message) {
+        if ((h.flags & ~(end_stream | compressed | more)) != 0) return error::invalid_flags;
+        if (h.aux != 0) return error::invalid_aux;
+        if ((h.flags & end_stream) != 0) {
+            if (h.flags != end_stream || h.length != 0) return error::invalid_flags;
+        } else {
+            if (h.head_length != 0 && h.head_length != message_descriptor_size) return error::invalid_head;
+            if (h.head_length == 0 && (h.flags & compressed) != 0) return error::invalid_flags;
+            if (h.head_length == 0 && h.length == 0) return error::invalid_length;
+        }
+    } else if (h.flags != 0 && !(h.type == frame_type::end && h.flags == not_executed)) return error::invalid_flags;
     switch (h.type) {
     case frame_type::settings:
         if (h.aux != 0) return error::invalid_aux;
@@ -163,10 +183,15 @@ error validate_header(frame_header const &h, limits bounds) noexcept {
         if (h.aux > 16) return error::invalid_aux;
         if (h.head_length < 2) return error::invalid_head;
         if (h.aux != 0 && h.length != h.head_length) return error::invalid_length;
+        if (h.flags == not_executed && h.aux == 0) return error::invalid_aux;
         break;
     case frame_type::cancel:
     case frame_type::ping:
     case frame_type::pong:
+        if (h.length != 0) return error::invalid_length;
+        break;
+    case frame_type::window_update:
+        if (h.aux == 0) return error::invalid_aux;
         if (h.length != 0) return error::invalid_length;
         break;
     case frame_type::goaway:
@@ -203,7 +228,7 @@ bool valid_utf8(bytes_view text) noexcept {
     return true;
 }
 
-error validate_head(frame_view const &frame) noexcept {
+error validate_head(frame_view const &frame, limits bounds) noexcept {
     switch (frame.header.type) {
     case frame_type::settings: return decode_settings(frame.head).code;
     case frame_type::request:
@@ -213,6 +238,15 @@ error validate_head(frame_view const &frame) noexcept {
         if (result.code != error::none) return result.code;
         return frame.header.aux == 0 && result.value.message.size != 0 ? error::invalid_head : error::none;
     }
+    case frame_type::message:
+        if (frame.head.size != 0) {
+            auto descriptor = decode_message_descriptor(frame.head, bounds);
+            if (descriptor.code != error::none) return descriptor.code;
+            if (((frame.header.flags & compressed) != 0) != (descriptor.value.algorithm != 0)) return error::invalid_flags;
+            if (frame.body.size > descriptor.value.encoded_size ||
+                ((frame.header.flags & more) != 0) != (frame.body.size < descriptor.value.encoded_size)) return error::invalid_length;
+        }
+        return error::none;
     case frame_type::goaway: return valid_utf8(frame.head) ? error::none : error::invalid_head;
     default: return error::none;
     }
@@ -302,9 +336,28 @@ decode_result<frame_view> decode_frame(bytes_view input, limits bounds) noexcept
     if (h.length > input.size - header_size) return failed<frame_view>(error::need_more);
     frame_view frame{h, {input.data + header_size, h.head_length},
                      {input.data + header_size + h.head_length, h.length - h.head_length}};
-    auto const code = validate_head(frame);
+    auto const code = validate_head(frame, bounds);
     if (code != error::none) return failed<frame_view>(code);
     return {frame, error::none, header_size + static_cast<std::size_t>(h.length)};
+}
+decode_result<message_descriptor> decode_message_descriptor(bytes_view input, limits bounds) noexcept {
+    if (!valid(input)) return failed<message_descriptor>(error::invalid_argument);
+    if (input.size != message_descriptor_size) return failed<message_descriptor>(error::invalid_head);
+    message_descriptor value{load_le<std::uint32_t>(input.data), load_le<std::uint32_t>(input.data + 4), input.data[8]};
+    if (value.algorithm > 2 || (value.algorithm == 0 && value.encoded_size != value.decoded_size) ||
+        (value.algorithm != 0 && value.encoded_size == 0)) return failed<message_descriptor>(error::invalid_head);
+    if (value.algorithm != 0 && (bounds.features & message_compression) == 0) return failed<message_descriptor>(error::unsupported_feature);
+    if (value.encoded_size > bounds.max_message_size || value.decoded_size > bounds.max_message_size) return failed<message_descriptor>(error::message_too_large);
+    return {value, error::none, message_descriptor_size};
+}
+encode_result encode_message_descriptor(message_descriptor const &value, mutable_bytes_view output, limits bounds) noexcept {
+    std::uint8_t temporary[message_descriptor_size]{};
+    store_le(value.encoded_size, temporary); store_le(value.decoded_size, temporary + 4); temporary[8] = value.algorithm;
+    auto checked = decode_message_descriptor({temporary, message_descriptor_size}, bounds);
+    if (checked.code != error::none) return {checked.code, 0};
+    if (!valid(output)) return {error::invalid_argument, 0};
+    if (output.size < message_descriptor_size) return {error::output_too_small, 0};
+    std::memcpy(output.data, temporary, message_descriptor_size); return {error::none, message_descriptor_size};
 }
 
 decode_result<settings> decode_settings(bytes_view input) noexcept {
@@ -317,7 +370,7 @@ decode_result<settings> decode_settings(bytes_view input) noexcept {
         auto const key = r.varint();
         auto const number = r.varint();
         if (r.code() != error::none) break;
-        if (key < 1 || key > 6) continue;
+        if (key < 1 || key > 7) continue;
         auto const bit = static_cast<std::uint8_t>(1U << (key - 1));
         if ((seen & bit) != 0 || number > std::numeric_limits<std::uint32_t>::max())
             return failed<settings>(error::invalid_settings);
@@ -330,6 +383,7 @@ decode_result<settings> decode_settings(bytes_view input) noexcept {
         case 4: value.initial_stream_window = narrowed; break;
         case 5: value.max_method_ids = narrowed; break;
         case 6: value.compression = narrowed; break;
+        case 7: value.features = narrowed; break;
         default: break;
         }
     }
@@ -342,6 +396,7 @@ encode_result encode_settings(settings const &value, mutable_bytes_view output) 
     std::uint32_t const fields[] = {value.max_frame_size, value.max_message_size,
         value.max_concurrent_streams, value.initial_stream_window, value.max_method_ids, value.compression};
     for (std::size_t i = 0; i < 6; ++i) { w.varint(i + 1); w.varint(fields[i]); }
+    if (value.features != 0) { w.varint(7); w.varint(value.features); }
     return w.result();
 }
 
@@ -372,6 +427,13 @@ encode_result encode_request_head(request_head const &value, bool has_new_method
     write_metadata(w, value.metadata);
     return w.result();
 }
+encode_result request_head_size(request_head const &value, bool has_new_method) noexcept {
+    if (has_new_method == (value.method_name.size == 0)) return {error::invalid_head, 0};
+    writer w;
+    std::uint8_t timeout[8]{}; w.put({timeout, sizeof(timeout)});
+    if (has_new_method) w.field(value.method_name);
+    write_metadata(w, value.metadata); return w.result();
+}
 
 decode_result<end_head_view> decode_end_head(bytes_view input) noexcept {
     if (!valid(input)) return failed<end_head_view>(error::invalid_argument);
@@ -389,6 +451,11 @@ encode_result encode_end_head(end_head const &value, mutable_bytes_view output) 
     writer w{output};
     w.field(value.message);
     write_metadata(w, value.metadata);
+    return w.result();
+}
+encode_result encode_metadata(metadata_list value, mutable_bytes_view output) noexcept {
+    writer w{output};
+    write_metadata(w, value);
     return w.result();
 }
 

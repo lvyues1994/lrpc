@@ -1,12 +1,15 @@
 # 单分片 TCP 基准
 
-`unary_bench` 对照原始 net 固定长度回显与 `lrpc::unary` 原始字节 Echo。默认双方同进程、同线程、同一个
+`unary_bench` 对照原始 net 固定长度回显与 `lrpc::unary` 原始字节或 protobuf Echo。默认双方同进程、同线程、同一个
 `io_context`；也支持两进程各一个执行器线程。两种拓扑均使用一条回环 TCP 并启用 `TCP_NODELAY`。
-64 B / 4 KiB 是业务载荷；RPC 额外携带协议头。工具目前面向 Linux，各拓扑分别报告，不能外推生产网络的 p99。
+64 B / 4 KiB 是编码后的业务载荷；RPC 额外携带协议头。protobuf 单 bytes 字段分别放入 62/4093 B 内容。
+工具目前面向 Linux，各拓扑分别报告，不能外推生产网络的 p99。
 首轮数据与帧缓存实验结论见 [2026-09-27 实测报告](results/2026-09-27.md)。
 加长观察、跨进程与分配归因见 [P0 验证报告](results/2026-09-27-p0.md)。
 接收窗口优化、主机停顿诊断及尚未通过的严格门槛见 [开放负载复测](results/2026-09-27-open-load.md)。
 非自愿抢占、运行队列等待与内核跟踪进展见 [调度诊断](results/2026-09-27-scheduler.md)。
+本轮固定调用槽、共享截止与 protobuf 配对数据见 [运行时报告](results/2026-09-30-runtime.md)。
+与 gRPC、brpc、Alibaba coro_rpc 的本机真实 API 对照见 [四库性能报告](results/2026-09-30-libraries.md)。
 
 构建和运行：
 
@@ -66,10 +69,48 @@ CPU 亲和不等于独占 CPU，请同时查看环境文件中的 SMT、频率�
   不能用未通过轮次宣称满足对应负载下的低 p99。
   插桩构建的 `diagnostic_only=true`，不计入可用于延迟验收的轮次。
 
-常用单次选项：`--transport net|rpc`、`--bytes 64|4096`、`--inflight N`、`--backend epoll|poll|select|io_uring`、
+常用单次选项：`--transport net|rpc`、`--codec bytes|protobuf`、`--bytes 64|4096`、`--inflight N`、`--backend epoll|poll|select|io_uring`、
 `--rate R`（0 为闭环）、`--burst N`、`--rpc-streams N`（服务端 stream 上限）、`--deadline-us N`、
 `--frame-allocator system|recycling`、`--receive-buffer-bytes N`、`--samples path.csv`。raw 不实现逐调用截止。单次运行阶段含预热有 30 秒看门狗，
 随后关闭并用 `context.run()` 排空，该清理阶段没有内部截止；suite 另对客户端进程设 60 秒超时。
+
+protobuf 基准要求同时开启 `LRPC_BUILD_PROTOBUF`、`LRPC_BUILD_CODEGEN` 和 `LRPC_BUILD_BENCHMARKS`；raw net 仅支持 bytes。
+protobuf prepare 在计时前设置请求字段，API 区间包含 codec 编码、服务端解码/编码和客户端解码，内容验证在计时结束后。
+为与旧实现保持相同驱动，该基准使用兼容的字符串 typed 入口，不测生成 Stub 的冷绑定收益。
+
+`compare_runtime.py` 配对两个二进制：closed 默认覆盖两种 codec、64/4096 B、1/8/64 在飞和 0/50 ms 截止；
+open-core 使用每秒 30 万次计划发起、128 个驱动槽。隔轮反转版本和配置顺序，支持同线程/跨进程。
+它分别记录旧库归档、共用驱动快照、旧构建配置和新源码，逐轮核对输出配置与 CSV，保留失败或无效轮次。
+
+```sh
+uv run --offline python benchmarks/compare_runtime.py \
+  --before build/runtime-baseline/unary_bench \
+  --after build/protobuf-release/benchmarks/unary_bench \
+  --baseline-source build/runtime-baseline \
+  --out build/bench-results/runtime-closed --rounds 3 --iterations 20000 --warmup 2000
+```
+
+旧二进制必须在改实现前冻结；baseline-source 包含 implementation.tar（旧库）、harness.tar（共用基准/CMake）和 config/。
+当前工作树不能替代旧二进制来源。`--inflight 1` 可用于延长首要场景；分配插桩二进制另跑，延迟不参与验收。
+`bench-alloc` 的 `api_probe` 仅比较无网络的 task/直接 awaiter 表示，不是端到端 RPC 性能证据。
+
+后续阶段的缓存/入口实验使用 `--arena-cache N`（每 unary adapter 的 protobuf Arena 槽数，默认 0）、
+`--rpc-entry client|channel|runtime`（默认 client）、`--runtime-cpu0/1 CPU`。
+channel 与 client 共用单执行器和单连接；runtime 为两分片、两连接、三个线程，驱动线程之外使用两个显式绑定的 worker CPU。
+runtime 结果衡量整套配置的成本，不能直接称为 facade 开销或多核扩展比。非 client 入口暂不支持跨进程或 recycling 模式。
+
+```sh
+uv run --offline python benchmarks/upgrade_suite.py \
+  --binary build/protobuf-release/benchmarks/unary_bench \
+  --before build/runtime-baseline/steps-1-4-unary-bench \
+  --out build/bench-results/steps5-11 \
+  --rounds 5 --iterations 30000 --warmup 3000 --cpu 2 --worker-cpus 4 6
+```
+
+此脚本交替比较冻结的 1–4 步二进制与当前默认路径、system/recycling、每调用 Arena/64 槽缓存、三种入口。
+逐请求 CSV 独立验证，错误/无效轮原样保留并标注 eligible，不用于成功 p99 验收。
+本轮中间基线只冻结了二进制和哈希，没有对应的中间源码归档，不能宣称该基线可由当前源码完全重建；
+完整来源要求见前述 compare_runtime。实测与缓存选择见 [升级阶段报告](results/2026-09-30-upgrade.md)。
 
 帧缓存和分配诊断：
 

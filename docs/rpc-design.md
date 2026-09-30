@@ -119,10 +119,12 @@ SETTINGS 的 head 是若干 `varint key, varint value`：
 | 4 `initial_stream_window` | 流式调用每流的初始接收窗口（字节） | 1 MiB |
 | 5 `max_method_ids` | 驻留方法表的上限（§4.5） | 4096 |
 | 6 `compression` | 支持的压缩算法位图（bit0 zstd、bit1 lz4） | 0 |
+| 7 `features` | 扩展特性位图（bit0 明确拒绝证明、bit1 流式 MESSAGE、bit2 消息压缩） | 0 |
 
 空 SETTINGS head 使用全部默认值；省略的键使用其默认值。未知键及其重复项解析后忽略，重复已知键拒绝。
 已知值限定为 uint32，wire 层允许 0（例如不接纳调用、只接受空消息）；连接层另行验证本地配置和协商结果是否可用。
-第一阶段本端公布 `compression = 0`。
+双方 features 的交集决定扩展语法；缺省零保留原始一元语法。默认连接公布明确拒绝证明，但压缩位图为零，流窗口为零。
+流式实现的消息描述符和窗口计费规则以 §17.2 为准。
 
 ### 4.2 帧头（16 字节）
 
@@ -746,16 +748,19 @@ struct retry_policy {
 
 同步代码可以用 `net::test::run_blocking` 式的包装（`rpc::call_sync`）阻塞等待，只用于工具与测试。
 
-## 8. 截止时间轮
+## 8. 共享截止调度器
 
-客户端调用的截止、服务端调用的截止、连接保活都挂在每个分片的一个时间轮上：
+本轮使用每 `io_context` 一份固定容量最小堆、一条 driver 和一个 `net::steady_timer`；client 与 server 共用。
+冷构造按最大调用槽数预留容量，节点内嵌在调用槽内，插入/摘除 O(log N)、不分配堆节点。
+绝对截止不按桶取整，不允许提前触发；实际回调可能因调度迟到而延后。
 
-- 单层哈希时间轮：4096 个桶 × 1 ms（覆盖 4 s），更远的放在溢出链，每转一圈重新分桶一次。节点侵入在 `stream_state`
-  与连接里（双向链），插入 / 摘除 O(1)、零分配。
-- 一个分片一个 `net::steady_timer`，只在轮非空时武装到下一个非空桶的时刻；到期处理完当前桶再武装下一个。轮空了定时器
-  就停，第一次插入时重新武装。io_uring 上每次武装是一个 SQE，但频率是每个非空毫秒最多一次，不是每次调用一次。
-- 精度：到期最多晚一个桶（1 ms，可配置）。RPC 截止通常是毫秒级；要求亚毫秒截止的调用可以在调用方自己套
-  `net::timeout()`（每次 +153 ns、1 次分配）。
+- 新较早截止或堆空会取消当前 wait；只有 driver 消费旧完成后才能重新武装。
+- 到期先摘节点再回调，每 64 项让出一次。没有有限截止时不武装 timer；端点关闭/排空后释放后台工作。
+- timer 的非取消错误使已有有限截止以 `unavailable` 完成，后续有限截止准入拒绝。
+- 初稿的 4096 × 1 ms 时间轮作为后续可评估方案；本轮保持精确截止，不增加一毫秒量化误差。
+  不宣称已经达到每次截止 ≤ 20 ns 的预算。连接保活尚未实现。
+
+详细生命周期、失败恢复及接口选择见 [运行时升级](runtime-upgrade.md)。
 
 ## 9. 编解码与代码生成
 
@@ -869,20 +874,20 @@ enum class status_code : std::uint8_t {
     out_of_range = 11, unimplemented = 12, internal = 13, unavailable = 14, data_loss = 15, unauthenticated = 16,
 };
 
-struct status {                          // 值类型：成功时不分配
-    status_code code() const noexcept;
-    char const* message() const noexcept; // 错误说明；成功时 ""
-    bool ok() const noexcept;
-    // 错误时的说明按需分配（错误路径），成功路径只是一个字节的码
+struct status {                          // 拥有说明；空说明不分配
+    status_code code = status_code::ok;
+    std::string message{};               // 支持二进制说明，包括 NUL
 };
 ```
 
 - 码值与 gRPC 一致，将来做 gRPC 适配时直接映射。
-- 提供 `rpc::status_category()`（`std::error_category`），`status` 能转成 `std::error_code`；`deadline_exceeded` 与 net 的
+- 提供 `rpc::status_category()`（`std::error_category`），`status_code` 能转成 `std::error_code`（使用 `result.code`）；`deadline_exceeded` 与 net 的
   `cond::timeout` 等价，`cancelled` 与 `cond::canceled` 等价——调用方可以用同一套条件判断 net 与 rpc 的错误。
-- 热路径不抛异常；处理协程抛出的异常在 `done` 回调里变成 `internal`，异常说明不发给对端（避免泄露内部信息），只记日志。
+- 热路径不抛异常；处理协程抛出的异常在 `done` 回调里变成 `internal`，异常说明不发给对端（避免泄露内部信息），日志钩子尚待实现。
 
 ## 11. 内存与每次调用的分配预算
+
+下表为最终预算目标；本轮 A 保留 task 包装分配，调用槽、流表和截止堆已固定容量化。服务端 wrapper worker 可复用，用户 handler/typed adapter 帧与 StopState 仍有分配，Arena 可扩容。实际计数见 [运行时报告](../benchmarks/results/2026-09-30-runtime.md)。
 
 | 对象 | 放在哪 | 一元调用的稳态分配 |
 | --- | --- | --- |
@@ -984,7 +989,7 @@ struct status {                          // 值类型：成功时不分配
 | `SO_REUSEPORT` 的具名选项 | 每分片接受器（§6.1） | 可用 `socket_option::boolean<SOL_SOCKET, SO_REUSEPORT>` 代替 |
 | 帧不分配的 TLS 读写驱动 | TLS 连接的每次读写（§5.8） | 每次读写一个 task 帧 |
 | io_uring `SEND_ZC` | 大消息发送（§5.3） | 未使用 |
-| io_uring 用户态定时器堆 | 与 rpc 无直接关系（时间轮已避开） | 每次限时一个内核超时，+580 ns |
+| io_uring 用户态定时器堆 | 共享精确调度器武装定时器时仍涉及 | 每次限时一个内核超时，+580 ns |
 
 第一阶段每次新建 `stop_source`，其复用能力属于后续分配优化，不阻塞实现。task 启动直接使用 §6.3 的已有公开接口。
 
@@ -995,8 +1000,8 @@ struct status {                          // 值类型：成功时不分配
 | 以 gRPC（HTTP/2）为主协议 | 一元调用每个方向 2–3 帧、HPACK 状态、每消息 5 字节前缀、两级流控的 WINDOW_UPDATE；互通需求可以由协议层的适配器满足（连接之上换一套帧读写），不必让所有调用付这份代价 |
 | 所有线程 `run()` 同一个 `io_context` | net 实测 4 线程 1.8×、io_uring 1.42×；锁与线程交接在每次完成上付费 |
 | 方法名每次随请求发送 / 32 位哈希 | 前者每次多几十字节和一次字符串查找；后者碰撞时静默调用错误的方法 |
-| 每次调用 `net::timeout()` 做截止 | +153 ns、1 次分配，io_uring 上 +580 ns；时间轮每次约 10 ns、零分配 |
-| 每次调用 `run_async` 启动处理协程 | 2 次分配、46 ns；池化上下文里嵌完成帧是 0 次 |
+| 每次调用 `net::timeout()` 做截止 | +153 ns、1 次分配，io_uring 上 +580 ns；本轮共享堆不分配节点，精确成本仍需实测 |
+| 每次调用 `run_async` 启动处理协程 | 2 次分配、46 ns；本轮长期 worker 复用 wrapper，用户处理协程帧仍分配 |
 | 调用方直接写套接字（加锁串行化） | 失去写合并，每个调用一次系统调用；锁在多核上争用 |
 | 读协程完成调用时嵌套恢复调用方 | 调用方可能销毁连接；并且打断批量处理（§5.5） |
 | 流号 64 位、永不轮换 | 帧头多 4 字节；轮换的代价是约半小时一次连接建立 |
@@ -1008,18 +1013,18 @@ struct status {                          // 值类型：成功时不分配
    客户端（固定端点）与服务端（单分片接入）；`status`、取消与截止、按方法上限预留响应存储及默认快速拒绝。
    验证 §5.9 的容量不变量并补齐接收与调用对象的资源边界，再用基准 1、2 对照裸 net；可选有限排队仅在截止、
    取消出队与队列容量测试通过后开启。
-2. **protobuf 与生成代码**：`codec` 的 protobuf 特化、protoc 插件、Arena；服务端调用上下文池；截止时间轮与分配优化
+2. **protobuf 与生成代码**：`codec` 的 protobuf 特化、protoc 插件、Arena；服务端调用上下文池；共享精确截止调度器与分配优化
    按实测收益引入，保持第一阶段的取消、截止和准入语义。
 3. **多分片**：`runtime`、接入分配（默认 + `SO_REUSEPORT`）、每分片子通道、`round_robin` / `power_of_two`、
    `static` / `dns` 解析器、子通道状态机与退避、GOAWAY 与排空。基准 3、4。
 4. **流式与治理接缝**：流式调用与每流窗口、背压、重试、拦截器、Unix 域与 TLS 传输。基准 5、6。
 5. **io_uring 专门路径与其它**：`receive_source` 零拷贝接收、`byte_buffer`、压缩、指标导出；对照基准 7。
 
-### 17.1 当前实现边界
+### 17.1 默认单帧一元路径
 
-当前已落地 `lrpc::wire`、`lrpc::codec`、`lrpc::unary` 和可选的 `lrpc::protobuf`：C++14、TCP、单分片的一元调用；公开接口在
+默认 profile 使用 `lrpc::wire`、`lrpc::codec`、`lrpc::unary` 和可选的 `lrpc::protobuf`：C++14、TCP、单分片的一元调用；公开接口在
 `unary/include/rpc/unary.hpp`，运行示例在 `examples/unary_echo.cpp`。实现以取消、截止、准入及关闭时的资源所有权为基线，
-已建立原始字节、同线程及跨进程 epoll 回环的测量工具，尚未完成 §13 的完整性能验收。下列条目记录当前实现，前文的对象池、时间轮等仍是后续目标。
+已建立原始字节与 protobuf、同线程及跨进程 epoll 回环的测量工具，尚未完成 §13 的完整性能验收。固定调用槽和共享截止调度已落地；前文超出下列边界的部分仍是目标设计。
 
 - 连接各有一条读链和写链。读链每处理 64 帧主动让出；写链每批最多 16 帧、256 KiB，单帧超过 256 KiB 时独占一批。
   取消已开始写入的请求不会截断帧；写失败则关闭连接，最后一份缓冲引用在 I/O 完成被消费后释放。
@@ -1033,26 +1038,26 @@ struct status {                          // 值类型：成功时不分配
 - 本实现允许的本端 `max_frame_size` 为 36 字节到 16 MiB。`connection_options.receive_buffer_bytes` 控制每连接固定接收窗口：
   默认 `0` 使用 `max_frame_size + 16`；显式值必须在 `[max_frame_size + 16, 16 MiB + 16]` 内。
   增大窗口可在一次读取中接收多帧，不改变 SETTINGS、允许的帧大小或请求/响应池预算。
-  `max_connections` 包含已关闭但仍被 I/O、handler 或 deadline task 持有的连接，因此服务端接收缓冲总量不超过
+  `max_connections` 包含已关闭但仍被 I/O 或 handler 持有的连接，因此服务端接收缓冲总量不超过
   `max_connections × 实际接收窗口字节数`。连接名额在接收缓冲和其它连接资源析构后归还；窗口分配失败回滚该名额。
 - 服务端方法槽由 `max_connections × (max_method_ids + 1)` 限制，方法 ID 上限最多 65536；客户端方法名长度和驻留数量也受配置限制。
   服务端活跃调用受 `max_active_calls`、每连接 stream 上限及请求/响应池共同约束；取消后尚未退出的 handler 仍占用调用名额。
-  客户端 pending 表受本端与 peer 较小的 stream 上限以及请求池约束。调用对象、协程帧和标准容器仍有动态分配。
+  客户端 pending 表受本端与 peer 较小的 stream 上限以及请求池约束。调用槽和流号索引固定容量，代际 handle 隔离已复用槽与旧 tx 帧；通知消费并注销取消 callback 后才归还槽。公开 task、用户 handler/typed adapter 帧及 StopState 仍有分配。
 - `resource_stats` 的三个 `*_bytes_in_use` 是当前整块占用，`storage_bytes` 是池的实际 payload 与 descriptor 容量之和，含空闲缓存。
   它不覆盖接收缓冲、方法表、调用对象、分配器元数据、传输层和用户 handler 的内存，不是 RSS 总量。
 - 截止沿用绝对时间，发送前编码剩余微秒，已过期的有限截止不得编码为无限；服务端从收到请求时计算截止。
-  当前以 `steady_timer` 与 `run_async` 建立正确性路径，未宣称达到时间轮或零分配目标。
+  client/server 共用每 context 一份预留最小堆、一条 driver 和一个 timer，不再逐调用创建 timer/root task；节点先摘除再回调，重挂前消费旧 wait。没有有限截止时不武装 timer；timer 异常使已有有限截止返回 unavailable。
 - API 与析构运行在所属分片线程；父 task 的 stop token 可从其它线程请求停止。`close()` 后继续运行 context 排空，
   `drain()` 不带自动宽限期，handler 若不响应取消且不结束会继续占额。
 - P2 的 `codec_ops` 与 `client::call_encoded` 将类型化消息接入相同的准入/取消/截止路径；请求直接编码到池块，响应直接解码到调用方对象。
   protoc 插件生成一元 service/stub、带幂等性和 codec 的描述符及自持有适配器的 bindings；部署时显式配置各方法响应上限。
-  当前使用 `net::task<call_result>` 和 `make_server(..., bindings)`，尚未引入前文的 `channel`、`server_builder`、池化 `unary_call` 或进程全局稠密下标。
-  每次类型化 handler 的非移动协程帧拥有带 2 KiB 初始块的 protobuf Arena，覆盖业务挂起及编码；可向堆扩容，未宣称零分配。
-  C++14 生成、proto2/3、optional、lite、嵌套/导入已验证；流式方法明确拒绝生成。
+  按 A 保留 `net::task<call_result>`。`server_builder` 与生成的 `add_<Service>_service` 已引入，旧 bindings/make_server 保留。Stub 构造冷绑定 service，生成 ordinal 与 client-bound 稠密 handle；warm 调用绕过字符串查表，首次线上驻留仍由连接分配 ID。channel 已在后续阶段实现；专用 unary_call 与进程全局下标尚未引入。
+  服务端调用槽和 wrapper worker 可复用，每次类型化 handler 的非移动协程帧拥有带 2 KiB 初始块的 protobuf Arena，覆盖业务挂起及编码；可向堆扩容，未宣称零分配。
+  C++14 生成、proto2/3、optional、lite、嵌套/导入已验证；流式方法在后续阶段已实现生成。
 - metadata 沿用既有 REQUEST/END 语法：请求通过 `call_options.metadata`，响应通过 `server_context.response_metadata.assign` 立即复制。
   `max_response_head_bytes` 默认 2，范围 2–65535，计入执行前预留和对端帧上限；超限使用原预留生成空 metadata 的 `END(internal)`。
   客户端提供 `call_options.response_metadata` 有界缓冲，在 `call_result.response_metadata` 中取得视图；默认丢弃，容量不足返回 `resource_exhausted`。
-  成功及错误 END 均可携带 metadata。实际 head 变短时，响应 body 在预留块内前移。完整 API 和生成示例见 [P2 用法](protobuf.md)。
+  成功及错误 END 均可携带 metadata。实际 head 变短时，响应 body 在预留块内前移。`status` 与 `call_result` 拥有 `.code/.message`，错误文本与 metadata 共用 head 预留；复制 OOM 返回无说明 resource_exhausted。生成服务保留 task<status_code>，set_status 桥接说明；手写 typed handler 也可返回 task<status>。完整 API 和生成示例见 [P2 用法](protobuf.md)。
 
 测试已覆盖真实回环 TCP 上的并发逆序完成、跨线程取消、超时、快速拒绝与恢复、GOAWAY，以及手动异步传输上的部分写、
 延迟取消完成、关闭后的缓冲/名额回收、异常握手、协议错误和拆包粘包。新增完成/取消/截止/关闭的确定顺序测试、
@@ -1065,7 +1070,41 @@ epoll/poll/select/io_uring 的 TCP 和外部取消线程压力矩阵已在 Debug
 跨进程每端各一执行器线程，其 CPU 统计只覆盖客户端。加长开放负载观察已出现调度迟到和拒绝，短轮通过不能外推持续稳定达标。
 分配归因见 [P0 验证报告](../benchmarks/results/2026-09-27-p0.md)；接收窗口优化及仍未通过的开放负载门槛见
 [后续复测](../benchmarks/results/2026-09-27-open-load.md)。帧缓存减少分配但未稳定改善 p99，当前保留默认系统分配器，
-调用对象池、时间轮及其余 §13 场景仍待完成。
+固定调用槽、共享精确截止调度器、方法绑定与状态已完成，多分片、有限排队与流式已在后续阶段接入；其余 §13 场景仍按专项验收。本轮生命周期、API 兼容边界见 [升级说明](runtime-upgrade.md)，配对基准见 [实测](../benchmarks/results/2026-09-30-runtime.md)。
 
 依赖 net 的冷定时器堆扩容 OOM 会在 `noexcept` 内终止进程，RPC 无法捕获；按本轮约定保持依赖不变，
 复现与故障测试覆盖边界见 [已知限制](net-timer-oom.md)。常规测试通过不表示所有分配失败均可恢复。
+
+### 17.2 连接池、固定分片与扩展消息路径
+
+后续阶段已实现 channel 与 runtime、两级有限准入、按证据/幂等性限制的一元重试、interceptor、追踪与 JSON 指标导出。
+固定分片拥有各自连接池和执行器，接入分片 round-robin 移交 TCP socket；跨 executor 和同步调用使用 runtime facade。
+channel 关闭先停止准入、按 grace 等待、取消并排空；server 的 shutdown 返回后仍须继续驱动 context；
+runtime 最终排空并 join，启动失败同样回滚并排空。当前未使用 SO_REUSEPORT。
+这些接口链接 `lrpc::runtime`；默认单分片 client 不隐式获得连接池行为。
+
+生成器覆盖 unary、client streaming、server streaming、bidirectional 及混合 service。
+streaming profile 显式协商，扩展 REQUEST body 为空；消息第一片 head 为 **9 字节**的小端描述符
+`encoded_size:u32, decoded_size:u32, algorithm:u8`，后续片 head 为空，MORE 与剩余编码长度严格一致。
+独立的空 MESSAGE|END_STREAM 表示半关闭，空消息本身保留描述符；END 承载最终状态和 metadata。
+unary 和 client-streaming 的成功响应必须恰好一条；unary 最终 END(OK) 前不向用户对象解码。
+重复 SETTINGS、非法帧方向、重复/越界 GOAWAY、残缺消息或长度冲突关闭连接；handler 异常与非法成功说明转换为当前流 internal。
+
+本实现非 unary 流窗口扣除整条消息的 **max(encoded_size, decoded_size, 1)**，覆盖压缩前后与空消息；扩展 unary 不扣逐流窗口。
+与前文按 body 字节描述的目标规则相比，这是当前扩展 profile 的实际计费规则。
+整条消息必须能容纳于 peer 初始窗口；容量不足拒绝，不无限等待。最终接收 buffer/切片释放后返还 WINDOW_UPDATE，
+另有消息数量上限。一流一次只排一片，单写链 FIFO 交错，控制帧优先；REQUEST/CANCEL 维持线序。
+默认单帧路径不引入该窗口/重组队列。扩展服务端接受旧客户端的小消息 unary；扩展客户端对旧服务端返回 unimplemented。
+流式 server 当前直接准入，非零 server max_queued_calls 不受支持。
+
+`lrpc::message` 提供拥有型分段 byte_buffer、共享物理容量预算、slice/join 和 zstd-frame/LZ4-block；可脱离 net 构建。
+owned gather 发送保留存储至部分写完成，单片接收可移交 RPC 存储，分片重组与解压预先取得容量。
+每连接 payload budget 受 server 共享父 budget 约束，接收/source/压缩工作区与通知另受 auxiliary budget 约束。
+固定辅助额度在握手后激活数据面时校验；握手前的窗口/工作区分配另受连接数量上限限制。
+消息切片保留整块计费，关闭后延迟释放不访问已销毁 executor。可选 receive_source 当前复制后端缓冲并按字节归还；
+net 未提供可分离租约，因此没有实现内核到业务的端到端零拷贝。
+压缩默认构建关闭，开启需 zstd/LZ4 开发包、双方 feature/算法协商和解压长度/额度校验。
+
+帧回收与有界 protobuf Arena 缓存均显式启用，默认配置保留；公开返回类型继续是 net::task<call_result>。
+完整配置、资源和关闭契约见 [运行时升级](runtime-upgrade.md)，生成接口见 [protobuf 用法](protobuf.md)，
+专项性能证据见 [升级实测](../benchmarks/results/2026-09-30-upgrade.md)。Unix 域/TLS（第 9 步）、SO_REUSEPORT 与 §13 全部性能验收不在本阶段交付范围。

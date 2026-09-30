@@ -7,6 +7,7 @@
 
 #include <array>
 #include <limits>
+#include <atomic>
 
 namespace rpc {
 namespace detail {
@@ -58,7 +59,7 @@ struct connection {
                block_pool &controls, byte_budget &control_budget, connection_observer &observer);
     void close() noexcept;
     void enqueue(block_lease frame) noexcept;
-    bool control(wire::frame_type type, std::uint32_t stream, std::uint32_t aux) noexcept;
+    bool control(wire::frame_type type, std::uint32_t stream, std::uint32_t aux, std::uint8_t flags = 0) noexcept;
 
     net::io_context &context;
     connection_options options;
@@ -75,11 +76,29 @@ struct connection {
     event outbound{};
     bool writing = false;
     std::size_t io_chains = 0;
+    clock::time_point last_activity = clock::now();
+    net::steady_timer keepalive;
+    std::uint32_t ping_sequence = 0;
+    clock::time_point ping_sent_at{};
+    bool ping_queued = false, awaiting_pong = false;
 };
 
+struct client_state;
+std::uint64_t next_client_identity();
+struct client_call;
+struct cancel_notice {
+    client_call *call;
+    void operator()() const noexcept;
+};
+enum class completion_phase { pending, publishing, published, cancelled };
 struct client_call {
-    explicit client_call(net::io_context &context) : wake(context) {}
-    net::steady_timer wake;
+    client_state *owner = nullptr;
+    slot_handle handle{};
+    net::continuation continuation{};
+    net::executor_ref executor{};
+    deadline_node timeout{};
+    inplace<net::stop_callback<cancel_notice>> cancellation{};
+    std::atomic<completion_phase> phase{completion_phase::published};
     std::uint32_t id = 0;
     std::size_t method_index = 0;
     clock::time_point deadline = clock::time_point::max();
@@ -89,12 +108,12 @@ struct client_call {
     wire::mutable_bytes_view response_metadata{};
     std::size_t method_bytes = 0;
     call_result result{};
-    bool done = false;
     bool submitted = false;
 };
 
 void validate_options(connection_options const &options);
 clock::time_point resolve_deadline(call_options options) noexcept;
+clock::time_point resolve_deadline(clock::time_point deadline, std::chrono::microseconds timeout) noexcept;
 clock::time_point deadline_after(std::uint64_t microseconds) noexcept;
 clock::time_point deadline_after(clock::time_point start, std::uint64_t microseconds) noexcept;
 std::uint64_t remaining_timeout(clock::time_point deadline) noexcept;

@@ -16,6 +16,7 @@ namespace {
 struct tcp_transport final : transport {
     explicit tcp_transport(net::tcp_socket socket) : socket_(std::move(socket)), stream_(&socket_) {}
     net::any_stream &stream() noexcept override { return stream_; }
+    net::socket_base *socket() noexcept override { return &socket_; }
     void close() noexcept override { socket_.close(); }
 private:
     net::tcp_socket socket_;
@@ -52,6 +53,8 @@ void validate_options(connection_options const &options) {
         options.receive.max_method_ids > 65536 || options.receive.compression != 0 ||
         options.max_method_name_bytes == 0 || options.max_method_name_bytes > 65000 ||
         options.handshake_timeout <= std::chrono::milliseconds::zero() ||
+        options.keepalive_interval < std::chrono::milliseconds::zero() ||
+        options.keepalive_timeout <= std::chrono::milliseconds::zero() ||
         (options.receive_buffer_bytes != 0 &&
          (options.receive_buffer_bytes < static_cast<std::size_t>(options.receive.max_frame_size) + wire::header_size ||
           options.receive_buffer_bytes > 16U * 1024U * 1024U + wire::header_size)))
@@ -65,9 +68,12 @@ clock::time_point deadline_after(clock::time_point now, std::uint64_t microsecon
 }
 clock::time_point deadline_after(std::uint64_t microseconds) noexcept { return deadline_after(clock::now(), microseconds); }
 clock::time_point resolve_deadline(call_options options) noexcept {
-    if (options.timeout == std::chrono::microseconds::zero()) return options.deadline;
-    if (options.timeout < std::chrono::microseconds::zero()) return clock::now();
-    return std::min(options.deadline, deadline_after(static_cast<std::uint64_t>(options.timeout.count())));
+    return resolve_deadline(options.deadline, options.timeout);
+}
+clock::time_point resolve_deadline(clock::time_point deadline, std::chrono::microseconds timeout) noexcept {
+    if (timeout == std::chrono::microseconds::zero()) return deadline;
+    if (timeout < std::chrono::microseconds::zero()) return clock::now();
+    return std::min(deadline, deadline_after(static_cast<std::uint64_t>(timeout.count())));
 }
 std::uint64_t remaining_timeout(clock::time_point deadline) noexcept {
     if (deadline == clock::time_point::max()) return 0;
@@ -89,11 +95,12 @@ connection::connection(net::io_context &ctx, connection_options config, block_po
                        byte_budget &budget, connection_observer &sink)
     : context(ctx), options(config), controls(pool), control_budget(budget), observer(sink),
       rx(config.receive_buffer_bytes != 0 ? config.receive_buffer_bytes :
-         static_cast<std::size_t>(config.receive.max_frame_size) + wire::header_size) {}
+         static_cast<std::size_t>(config.receive.max_frame_size) + wire::header_size), keepalive(ctx) {}
 
 void connection::close() noexcept {
     if (state == phase::closed) return;
     state = phase::closed;
+    keepalive.cancel();
     if (link) link->close();
     tx.clear();
     outbound.signal();
@@ -107,16 +114,16 @@ void connection::enqueue(block_lease frame) noexcept {
     tx.push(std::move(frame));
     outbound.signal();
 }
-bool connection::control(wire::frame_type type, std::uint32_t stream, std::uint32_t aux) noexcept {
+bool connection::control(wire::frame_type type, std::uint32_t stream, std::uint32_t aux, std::uint8_t flags) noexcept {
     if (state == phase::closed) return false;
     auto storage = controls.acquire(control_budget);
     if (storage.get() == nullptr) { close(); return false; }
     auto &node = *storage.get();
     wire::frame_header h{};
-    h.type = type; h.stream_id = stream; h.aux = aux;
+    h.type = type; h.stream_id = stream; h.aux = aux; h.flags = flags;
     if (type == wire::frame_type::end) { h.length = 2; h.head_length = 2; node.data[16] = 0; node.data[17] = 0; }
     auto const encoded = wire::encode_header(h, {node.data, controls.block_size()},
-                                             {peer.max_frame_size, peer.max_message_size});
+                                             {peer.max_frame_size, peer.max_message_size, options.receive.features & peer.features});
     if (encoded.code != wire::error::none) { close(); return false; }
     node.size = wire::header_size + h.length;
     enqueue(std::move(storage));
@@ -128,7 +135,8 @@ auto read_frame(connection &value)
             net::io_result<std::size_t> received; wire::decode_result<wire::frame_view> decoded;) {
     for (;;) {
         decoded = wire::decode_frame({value.rx.data() + value.rx_begin, value.rx_end - value.rx_begin},
-                                    {value.options.receive.max_frame_size, std::numeric_limits<std::uint32_t>::max()});
+                                    {value.options.receive.max_frame_size, std::numeric_limits<std::uint32_t>::max(),
+                                     value.options.receive.features & value.peer.features});
         if (decoded.code == wire::error::none) {
             value.rx_begin += decoded.consumed;
             CO2_RETURN((net::io_result<wire::frame_view>{{}, decoded.value}));
@@ -157,7 +165,10 @@ auto send_settings(connection &value, bool with_preface)
     if (storage.get() == nullptr) CO2_RETURN((net::io_result<>{std::make_error_code(std::errc::no_buffer_space)}));
     prefix = with_preface ? wire::preface_size : 0;
     if (with_preface) wire::encode_preface({storage.get()->data, prefix});
-    encoded = wire::encode_settings(value.options.receive, {storage.get()->data + prefix + 16, 36});
+    encoded = wire::encode_settings(value.options.receive,
+        {storage.get()->data + prefix + 16, value.controls.block_size() - prefix - 16});
+    if (encoded.code != wire::error::none || encoded.written > value.options.receive.max_frame_size)
+        CO2_RETURN((net::io_result<>{std::make_error_code(std::errc::no_buffer_space)}));
     header.length = static_cast<std::uint32_t>(encoded.written);
     header.head_length = static_cast<std::uint16_t>(encoded.written);
     wire::encode_header(header, {storage.get()->data + prefix, 16});
@@ -200,6 +211,13 @@ auto reader_loop(connection &value, std::shared_ptr<connection_observer> owner)
     while (value.state != phase::closed) {
         CO2_AWAIT_SET(frame, read_frame(value));
         if (frame.ec) { value.close(); break; }
+        value.last_activity = clock::now();
+        if (frame.value.header.type == wire::frame_type::pong &&
+            (value.awaiting_pong || value.ping_queued) && frame.value.header.aux == value.ping_sequence) {
+            value.awaiting_pong = false;
+            value.ping_queued = false;
+            value.keepalive.cancel();
+        }
         owner->on_frame(frame.value);
         if (++turn == 64) { turn = 0; CO2_AWAIT((yield_awaiter{})); }
     }
@@ -247,10 +265,35 @@ auto writer_loop(connection &value, std::shared_ptr<connection_observer> owner)
         CO2_AWAIT_SET(sent, net::write(value.link->stream(), net::const_buffer_span{buffers.data(), count}));
         // net::write finishes all partial writes, or closes the connection on
         // failure below. Never skip a cancelled request's in-flight frame tail.
-        for (std::size_t i = 0; i < count; ++i) batch[i].reset();
+        for (std::size_t i = 0; i < count; ++i) {
+            if (!sent.ec && value.ping_queued && batch[i].get()->data[8] == static_cast<std::uint8_t>(wire::frame_type::ping)) {
+                value.ping_queued = false; value.awaiting_pong = true;
+                value.ping_sent_at = clock::now(); value.keepalive.cancel();
+            }
+            batch[i].reset();
+        }
         value.writing = false;
         if (sent.ec) { value.close(); break; }
+        value.last_activity = clock::now();
         owner->on_idle();
+    }
+    CO2_RETURN();
+}
+CO2_END
+
+auto keepalive_loop(connection &value, std::shared_ptr<connection_observer> owner)
+    CO2_BEG(net::task<>, (value, owner), net::io_result<> waited;) {
+    while (value.state != phase::closed) {
+        value.keepalive.expires_at(value.awaiting_pong ? value.ping_sent_at + value.options.keepalive_timeout :
+                                   value.ping_queued ? clock::time_point::max() :
+                                   value.last_activity + value.options.keepalive_interval);
+        CO2_AWAIT_SET(waited, value.keepalive.wait());
+        if (value.state == phase::closed) break;
+        if (waited.ec == net::cond::canceled) continue;
+        if (waited.ec || value.awaiting_pong) { value.close(); break; }
+        if (clock::now() < value.last_activity + value.options.keepalive_interval) continue;
+        value.ping_queued = true;
+        if (!value.control(wire::frame_type::ping, 0, ++value.ping_sequence)) break;
     }
     CO2_RETURN();
 }
@@ -265,6 +308,11 @@ void start_io(connection &value, std::shared_ptr<connection_observer> owner) {
     ++value.io_chains;
     try { net::run_async(value.context.get_executor(), done, failed)([owner, &value] { return writer_loop(value, owner); }); }
     catch (...) { --value.io_chains; value.close(); throw; }
+    if (value.options.keepalive_interval != std::chrono::milliseconds::zero()) {
+        ++value.io_chains;
+        try { net::run_async(value.context.get_executor(), done, failed)([owner, &value] { return keepalive_loop(value, owner); }); }
+        catch (...) { --value.io_chains; value.close(); throw; }
+    }
 }
 
 bool encode_end(block &storage, std::uint32_t id, status_code code, std::size_t body_size,

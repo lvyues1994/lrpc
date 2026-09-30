@@ -32,6 +32,8 @@ options parse(int argc, char **argv) {
         if (i + 1 == argc) throw std::invalid_argument{"missing option value: " + key};
         std::string const value = argv[++i];
         if (key == "--transport") { config.transport = value; continue; }
+        if (key == "--codec") { config.codec = value; continue; }
+        if (key == "--rpc-entry") { config.rpc_entry = value; continue; }
         if (key == "--samples") { config.samples = value; continue; }
         if (key == "--allocation-trace") { config.allocation_trace = value; continue; }
         if (key == "--role") { config.role = value; continue; }
@@ -51,6 +53,9 @@ options parse(int argc, char **argv) {
             throw std::invalid_argument{"nonnegative integer required: " + key};
         auto const number = std::stoull(value);
         if (key == "--bytes") config.bytes = static_cast<std::size_t>(number);
+        else if (key == "--runtime-cpu0") config.runtime_cpu0 = static_cast<unsigned>(number);
+        else if (key == "--runtime-cpu1") config.runtime_cpu1 = static_cast<unsigned>(number);
+        else if (key == "--arena-cache") config.arena_cache = static_cast<std::size_t>(number);
         else if (key == "--inflight") config.inflight = static_cast<std::size_t>(number);
         else if (key == "--iterations") config.iterations = static_cast<std::size_t>(number);
         else if (key == "--warmup") config.warmup = static_cast<std::size_t>(number);
@@ -63,7 +68,12 @@ options parse(int argc, char **argv) {
         else if (key == "--port" && number <= 65535) config.port = static_cast<std::uint16_t>(number);
         else throw std::invalid_argument{"unknown option: " + key};
     }
-    if ((config.transport != "net" && config.transport != "rpc") || (config.bytes != 64 && config.bytes != 4096) ||
+    if ((config.transport != "net" && config.transport != "rpc") ||
+        config.arena_cache > 65536 || (config.arena_cache && config.codec != "protobuf") ||
+        (config.rpc_entry != "client" && config.rpc_entry != "channel" && config.rpc_entry != "runtime") ||
+        (config.rpc_entry != "client" && (config.transport != "rpc" || config.role != "both" || config.recycle_frames)) ||
+        (config.codec != "bytes" && config.codec != "protobuf") ||
+        (config.transport == "net" && config.codec != "bytes") || (config.bytes != 64 && config.bytes != 4096) ||
         config.inflight == 0 || config.inflight > 1024 || config.iterations == 0 || config.iterations > 10000000 ||
         config.warmup == 0 || config.warmup > 1000000 || config.burst == 0 || config.burst > 1024 ||
         config.receive_buffer_bytes < 8208 || config.receive_buffer_bytes > 16U * 1024U * 1024U + 16 ||
@@ -79,6 +89,9 @@ options parse(int argc, char **argv) {
         throw std::invalid_argument{"allocation tracing is recorded by the measurement process only"};
 #ifndef LRPC_BENCH_COUNT_ALLOCATIONS
     if (!config.allocation_trace.empty()) throw std::invalid_argument{"allocation trace requires bench-alloc or diagnose build"};
+#endif
+#ifndef LRPC_BENCH_PROTOBUF
+    if (config.codec == "protobuf") throw std::invalid_argument{"protobuf benchmark requires LRPC_BUILD_PROTOBUF and LRPC_BUILD_CODEGEN"};
 #endif
     return config;
 }
@@ -156,12 +169,14 @@ void report(options const &config, measurements const &result) {
         *std::max_element(schedule_lag.begin(), schedule_lag.end()) <= static_cast<double>(config.max_schedule_lag_us) * 1000;
     auto const count = static_cast<double>(config.iterations);
     std::cout << std::fixed << std::setprecision(3)
-        << "{\"transport\":\"" << config.transport << "\",\"mode\":\"" << (config.rate ? "open" : "closed")
+        << "{\"transport\":\"" << config.transport << "\",\"codec\":\"" << config.codec
+        << "\",\"mode\":\"" << (config.rate ? "open" : "closed")
         << "\",\"backend\":\"" << net::to_string(config.backend) << "\",\"build\":\"" << LRPC_BENCH_BUILD_TYPE
         << "\",\"raw_path\":\"" << (config.transport == "rpc" ? "none" : config.inflight == 1 && config.rate == 0 ? "direct" : "fifo")
-        << "\",\"topology\":\"" << (config.role == "client" ? "separate_process_loopback" : "same_thread_loopback")
+        << "\",\"topology\":\"" << (config.rpc_entry == "runtime" ? "fixed_shard_loopback" : config.role == "client" ? "separate_process_loopback" : "same_thread_loopback")
         << "\",\"cpu_scope\":\"" << (config.role == "client" ? "client_process" : "both_endpoints")
-        << "\",\"connections\":1,\"threads\":" << (config.role == "client" ? 2 : 1) << ",\"bytes\":" << config.bytes
+        << "\",\"rpc_entry\":\"" << config.rpc_entry << "\",\"connections\":" << (config.rpc_entry == "runtime" ? 2 : 1)
+        << ",\"threads\":" << (config.rpc_entry == "runtime" ? 3 : config.role == "client" ? 2 : 1) << ",\"bytes\":" << config.bytes
         << ",\"inflight_limit\":" << config.inflight << ",\"max_inflight\":" << result.maximum_inflight
         << ",\"rpc_streams\":" << config.rpc_streams << ",\"warmup\":" << config.warmup
         << ",\"offered\":" << config.iterations << ",\"started\":" << config.iterations - drops
@@ -170,6 +185,7 @@ void report(options const &config, measurements const &result) {
         << ",\"target_rate\":" << config.rate << ",\"burst\":" << config.burst << ",\"deadline_us\":" << config.deadline_us
         << ",\"receive_buffer_bytes\":" << config.receive_buffer_bytes
         << ",\"frame_allocator\":\"" << (config.recycle_frames ? "recycling" : "system") << '"'
+        << ",\"arena_cache_entries\":" << config.arena_cache
         << ",\"max_schedule_lag_us\":" << config.max_schedule_lag_us
         << ",\"diagnostic_only\":" << (diagnostic ? "true" : "false")
         << ",\"allocation_counting\":" << (counting ? "true" : "false")

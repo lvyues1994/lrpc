@@ -70,9 +70,19 @@ void collect_symbols(pb::FileDescriptor const &file, std::set<std::string> &symb
     for (int i = 0; i < file.dependency_count(); ++i) collect_symbols(*file.dependency(i), symbols, visited);
 }
 
+bool streaming(pb::MethodDescriptor const &method) { return method.client_streaming() || method.server_streaming(); }
+char const *kind(pb::MethodDescriptor const &method) {
+    if (method.client_streaming()) return method.server_streaming() ? "bidirectional" : "client_streaming";
+    return method.server_streaming() ? "server_streaming" : "unary";
+}
 std::string signature(pb::MethodDescriptor const &method, bool service) {
     auto const request = message_type(method.input_type());
     auto const response = message_type(method.output_type());
+    if (streaming(method)) {
+        if (service) return "::net::task<::rpc::status_code> " + identifier(method.name()) +
+            "(::rpc::server_context &context, ::rpc::server_stream<" + request + ", " + response + "> &stream)";
+        return "::net::task<::rpc::stream_call<" + request + ", " + response + ">> " + identifier(method.name()) + "(::rpc::call_options options = {})";
+    }
     return std::string{"::net::task<::rpc::"} + (service ? "status_code> " : "call_result> ") +
         identifier(method.name()) + "(" + (service ? "::rpc::server_context &context, " : "") +
         request + " const &request, " + response + " &response" +
@@ -106,15 +116,16 @@ bool validate(pb::FileDescriptor const &file, std::set<std::string> const &nativ
                 error = "rpc: generated C++ symbol collision: " + full; return false;
             }
         }
+        auto const registration = scope(file) + "add_" + service.name() + "_service";
+        if (!symbols.insert(registration).second || native.count(registration) != 0) {
+            error = "rpc: generated C++ symbol collision: " + registration; return false;
+        }
         std::set<std::string> methods;
         for (int i = 0; i < service.method_count(); ++i) {
             auto const &method = *service.method(i);
-            if (method.client_streaming() || method.server_streaming()) {
-                error = "rpc: streaming is not supported: " + method.full_name(); return false;
-            }
             auto const name = identifier(method.name());
             if (!methods.insert(name).second || name == service.name() + "Service" ||
-                name == service.name() + "Stub" || name == "lrpc_channel_") {
+                name == service.name() + "Stub" || name == "lrpc_channel_" || name == "lrpc_methods_") {
                 error = "rpc: generated C++ method collision: " + method.full_name(); return false;
             }
         }
@@ -131,10 +142,12 @@ void write_header(pb::ServiceDescriptor const &service, std::ostream &out) {
         out << "    ::rpc::method_limits " << identifier(service.method(i)->name()) << "{};\n";
     out << "};\n\n::rpc::service_descriptor const &" << name << "_service_descriptor();\n"
         << "std::vector<::rpc::method_binding> " << name << "_bindings(" << name << "Service &service, " << name << "Limits const &limits);\n\n"
+        << "::rpc::server_builder &add_" << name << "_service(::rpc::server_builder &builder, " << name << "Service &service, "
+        << name << "Limits const &limits);\n\n"
         << "class " << name << "Stub {\npublic:\n    explicit " << name << "Stub(::rpc::client &"
-        << (service.method_count() == 0 ? ") noexcept {}\n" : "channel) noexcept : lrpc_channel_(&channel) {}\n");
+        << (service.method_count() == 0 ? ") noexcept {}\n" : "channel);\n");
     for (int i = 0; i < service.method_count(); ++i) out << "    " << signature(*service.method(i), false) << ";\n";
-    if (service.method_count() != 0) out << "private:\n    ::rpc::client *lrpc_channel_;\n";
+    if (service.method_count() != 0) out << "private:\n    ::rpc::client *lrpc_channel_;\n    std::vector<::rpc::method_handle> lrpc_methods_;\n";
     out << "};\n\n";
 }
 
@@ -145,9 +158,9 @@ void write_descriptors(pb::ServiceDescriptor const &service, std::ostream &out) 
         out << "    static ::rpc::method_descriptor const methods[] = {\n";
         for (int i = 0; i < service.method_count(); ++i) {
             auto const &method = *service.method(i);
-            out << "        {\"" << wire_name(method) << "\", ::rpc::method_kind::unary, ::rpc::idempotency::" << semantics(method)
+            out << "        {\"" << wire_name(method) << "\", ::rpc::method_kind::" << kind(method) << ", ::rpc::idempotency::" << semantics(method)
                 << ", &::rpc::codec_for<" << message_type(method.input_type()) << ">(), &::rpc::codec_for<"
-                << message_type(method.output_type()) << ">()},\n";
+                << message_type(method.output_type()) << ">(), " << i << "},\n";
         }
         out << "    };\n";
     }
@@ -162,20 +175,35 @@ void write_bindings(pb::ServiceDescriptor const &service, std::ostream &out) {
     if (service.method_count() == 0) out << "    (void)service; (void)limits;\n";
     for (int i = 0; i < service.method_count(); ++i) {
         auto const &method = *service.method(i);
-        out << "    result.push_back(::rpc::bind_method(::rpc::method<" << message_type(method.input_type()) << ", "
-            << message_type(method.output_type()) << ">{\"" << wire_name(method) << "\"}, service, &" << name
+        out << "    result.push_back(::rpc::" << (streaming(method) ? "bind_stream_method" : "bind_method") << "(::rpc::method<" << message_type(method.input_type()) << ", "
+            << message_type(method.output_type()) << ">{\"" << wire_name(method) << "\"}, ";
+        if (streaming(method)) out << "::rpc::method_kind::" << kind(method) << ", ";
+        out << "service, &" << name
             << "Service::" << identifier(method.name()) << ", limits." << identifier(method.name()) << "));\n";
     }
-    out << "    return result;\n}\n\n";
+    out << "    return result;\n}\n\n"
+        << "::rpc::server_builder &add_" << name << "_service(::rpc::server_builder &builder, " << name << "Service &service, "
+        << name << "Limits const &limits) {\n    return builder.add(" << name << "_bindings(service, limits));\n}\n\n";
 }
 
 void write_stubs(pb::ServiceDescriptor const &service, std::ostream &out) {
+    if (service.method_count() != 0)
+        out << service.name() << "Stub::" << service.name() << "Stub(::rpc::client &channel)\n"
+            << "    : lrpc_channel_(&channel), lrpc_methods_(channel.bind(" << scope(*service.file()) << service.name()
+            << "_service_descriptor())) {}\n\n";
     for (int i = 0; i < service.method_count(); ++i) {
         auto const &method = *service.method(i);
+        if (streaming(method)) {
+            out << "::net::task<::rpc::stream_call<" << message_type(method.input_type()) << ", " << message_type(method.output_type()) << ">> "
+                << service.name() << "Stub::" << identifier(method.name()) << "(::rpc::call_options options) {\n"
+                << "    return ::rpc::open_stream<" << message_type(method.input_type()) << ", " << message_type(method.output_type())
+                << ">(*lrpc_channel_, lrpc_methods_[" << i << "], options);\n}\n\n";
+            continue;
+        }
         out << "::net::task<::rpc::call_result> " << service.name() << "Stub::" << identifier(method.name()) << "("
             << message_type(method.input_type()) << " const &request, " << message_type(method.output_type())
-            << " &response, ::rpc::call_options options) {\n    return lrpc_channel_->call_encoded(\"" << wire_name(method)
-            << "\", {&request, &::rpc::codec_for<" << message_type(method.input_type())
+            << " &response, ::rpc::call_options options) {\n    return lrpc_channel_->call_encoded(lrpc_methods_[" << i
+            << "], {&request, &::rpc::codec_for<" << message_type(method.input_type())
             << ">()}, {&response, &::rpc::codec_for<" << message_type(method.output_type()) << ">()}, options);\n}\n\n";
     }
 }
@@ -197,7 +225,7 @@ struct rpc_generator final : pb::compiler::CodeGenerator {
         if (!validate(*file, native, generated, *error)) return false;
         auto const base = file->name().substr(0, file->name().size() - 6);
         std::ostringstream header, source;
-        header << "// Generated by protoc-gen-rpc.\n#pragma once\n#include <rpc/protobuf.hpp>\n#include \"" << base << ".pb.h\"\n\n";
+        header << "// Generated by protoc-gen-rpc.\n#pragma once\n#include <rpc/protobuf.hpp>\n#include <rpc/stream.hpp>\n#include \"" << base << ".pb.h\"\n\n";
         source << "// Generated by protoc-gen-rpc.\n#include \"" << base << ".rpc.hpp\"\n\n";
         for (auto const &part : namespaces(file->package())) { header << "namespace " << part << " {\n"; source << "namespace " << part << " {\n"; }
         for (int i = 0; i < file->service_count(); ++i) {

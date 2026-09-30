@@ -115,16 +115,17 @@ net::task<rpc::status_code> lite_echo::Echo(rpc::server_context &, demo::lite::M
     return lite_reply(&req, &resp);
 }
 
-std::vector<rpc::method_binding> bindings(echo &service, lite_echo &lite) {
+std::unique_ptr<rpc::server> build(net::io_context &context, echo &service, lite_echo &lite, std::size_t cache_entries) {
+    rpc::server_builder builder{context};
     demo::EchoLimits limits{}; limits.RoundTrip = {256, 64}; limits.Required = {256, 64}; limits.delete_ = {256, 64};
-    auto result = demo::Echo_bindings(service, limits);
-    auto extra = demo::lite::Lite_bindings(lite, {{256, 2}});
-    result.insert(result.end(), std::make_move_iterator(extra.begin()), std::make_move_iterator(extra.end()));
-    return result;
+    limits.RoundTrip.message_cache_entries = limits.Required.message_cache_entries = limits.delete_.message_cache_entries = cache_entries;
+    demo::add_Echo_service(builder, service, limits);
+    demo::lite::add_Lite_service(builder, lite, {{256, 2, cache_entries}});
+    return builder.build();
 }
 
 struct fixture {
-    fixture() : server(rpc::make_server(context, bindings(service, lite))), client(rpc::make_client(context)),
+    explicit fixture(std::size_t cache_entries = 0) : server(build(context, service, lite, cache_entries)), client(rpc::make_client(context)),
                 endpoint(server->listen({net::ip::address_v4::loopback(), 0})), stub(*client), lite_stub(*client) {}
     template <class Factory> void run(Factory factory) {
         std::exception_ptr error;
@@ -255,6 +256,9 @@ int main(int argc, char **argv) {
         { fixture f; f.run([&] { return integration(&f); }); }
         { fixture f; f.run([&] { return cancellation(&f); }); }
         { fixture f; f.run([&] { return late_handler(&f); }); }
+        { fixture f{2}; f.run([&] { return integration(&f); }); }
+        { fixture f{2}; f.run([&] { return cancellation(&f); }); }
+        { fixture f{2}; f.run([&] { return late_handler(&f); }); }
         std::cout << "PASS protobuf codecs, generated stubs, Arena and cancellation\n";
     } catch (std::system_error const &error) {
         if (error.code() == std::errc::operation_not_supported || error.code() == std::errc::permission_denied) return 77;

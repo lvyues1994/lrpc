@@ -8,11 +8,16 @@ namespace wire {
 
 constexpr std::size_t header_size = 16;
 constexpr std::size_t preface_size = 8;
+constexpr std::size_t message_descriptor_size = 9;
 constexpr std::uint32_t max_stream_id = 0x7fffffffU;
 constexpr std::uint8_t end_stream = 0x01;
 constexpr std::uint8_t compressed = 0x02;
 constexpr std::uint8_t more = 0x04;
 constexpr std::uint8_t new_method = 0x08;
+constexpr std::uint8_t not_executed = 0x10;
+constexpr std::uint32_t explicit_rejection = 0x01;
+constexpr std::uint32_t streaming = 0x02;
+constexpr std::uint32_t message_compression = 0x04;
 
 // Borrowed storage. A nonzero size requires that many accessible bytes.
 // Decoded views remain valid only while the input is alive and unchanged.
@@ -84,12 +89,20 @@ struct frame_header {
 struct limits {
     std::uint32_t max_frame_size = 4U * 1024U * 1024U;
     std::uint32_t max_message_size = 64U * 1024U * 1024U;
+    std::uint32_t features = 0; // Negotiated profile; zero retains the v1 unary grammar.
 };
 
 struct frame_view {
     frame_header header{};
     bytes_view head{};
     bytes_view body{};
+};
+// First MESSAGE fragment only. Lengths describe the entire message. Algorithm
+// 0 is identity, 1 is a single zstd frame, 2 is an LZ4 block.
+struct message_descriptor {
+    std::uint32_t encoded_size = 0;
+    std::uint32_t decoded_size = 0;
+    std::uint8_t algorithm = 0;
 };
 
 struct settings {
@@ -99,6 +112,7 @@ struct settings {
     std::uint32_t initial_stream_window = 1024U * 1024U;
     std::uint32_t max_method_ids = 4096;
     std::uint32_t compression = 0;
+    std::uint32_t features = 0; // SETTINGS key 7; missing means the original unary profile.
 };
 
 struct metadata_entry {
@@ -145,14 +159,16 @@ encode_result encode_varint(std::uint64_t value, mutable_bytes_view output) noex
 encode_result encode_preface(mutable_bytes_view output) noexcept;
 decode_result<bool> decode_preface(bytes_view input) noexcept;
 
-// Header validation uses the current single-frame, uncompressed unary profile.
-// Streaming/fragmentation/compression report unsupported_feature. Connection
-// ordering, direction, SETTINGS negotiation and method tables belong above wire.
+// The default remains the original unary grammar. Extended MESSAGE/flow-control
+// grammar requires negotiated feature bits. Stateful ordering/reassembly and
+// algorithm negotiation belong above wire.
 decode_result<frame_header> decode_header(bytes_view input, limits bounds = {}) noexcept;
 encode_result encode_header(frame_header const &header, mutable_bytes_view output,
                             limits bounds = {}) noexcept;
 // Validates complete head grammar too; no allocation, I/O or body copies.
 decode_result<frame_view> decode_frame(bytes_view input, limits bounds = {}) noexcept;
+decode_result<message_descriptor> decode_message_descriptor(bytes_view input, limits bounds = {}) noexcept;
+encode_result encode_message_descriptor(message_descriptor const &, mutable_bytes_view output, limits bounds = {}) noexcept;
 
 // SETTINGS: omitted fields use defaults; unknown keys (including duplicates)
 // are ignored; repeated known keys are rejected. Known values are uint32_t,
@@ -164,8 +180,10 @@ encode_result encode_settings(settings const &value, mutable_bytes_view output) 
 decode_result<request_head_view> decode_request_head(bytes_view input, bool has_new_method) noexcept;
 encode_result encode_request_head(request_head const &value, bool has_new_method,
                                   mutable_bytes_view output) noexcept;
+encode_result request_head_size(request_head const &value, bool has_new_method) noexcept;
 decode_result<end_head_view> decode_end_head(bytes_view input) noexcept;
 encode_result encode_end_head(end_head const &value, mutable_bytes_view output) noexcept;
+encode_result encode_metadata(metadata_list value, mutable_bytes_view output) noexcept;
 decode_result<metadata_entry> decode_metadata_entry(bytes_view input) noexcept;
 
 } // namespace wire

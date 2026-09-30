@@ -41,7 +41,7 @@ auto perform(trial_state &state, slot &storage)
     auto &record = state.result.samples[storage.sample_index];
     record.completed = rpc::clock::now(); record.code = reply.code;
     if (reply.code == rpc::status_code::ok) {
-        if (reply.response_size != storage.request.size() || storage.request != storage.reply)
+        if (!state.transport.validate(storage, reply))
             throw std::runtime_error{"response validation failed; discard trial"};
     } else if (!state.measuring || state.config.transport == "net") {
         throw std::runtime_error{"warmup or raw transport failed; discard trial"};
@@ -57,6 +57,7 @@ void launch(trial_state &state, slot &storage, rpc::clock::time_point scheduled)
     state.result.last_offer = record.offered;
     auto const sequence = static_cast<std::uint64_t>(storage.sample_index);
     std::memcpy(storage.request.data(), &sequence, sizeof(sequence));
+    state.transport.prepare(storage);
     ++state.active;
     if (state.measuring) state.result.maximum_inflight = std::max(state.result.maximum_inflight, state.active);
     net::run_async(state.context.get_executor(), [&state, &storage] {
@@ -183,6 +184,7 @@ measurements run(options const &config) {
         try { context.run(); break; }
         catch (...) { fail(state, std::current_exception()); }
     }
+    transport->join();
     if (state.failure) std::rethrow_exception(state.failure);
     if (state.completed != config.iterations || state.active != 0) throw std::runtime_error{"incomplete trial"};
     result.samples.resize(config.iterations);

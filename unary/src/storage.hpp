@@ -1,6 +1,7 @@
 #pragma once
 
 #include <rpc/unary.hpp>
+#include "runtime.hpp"
 
 #include <vector>
 
@@ -23,7 +24,7 @@ struct block {
     std::size_t size = 0;
     std::size_t body_offset = 0;
     std::size_t body_size = 0;
-    std::weak_ptr<client_call> request{};
+    slot_handle request{};
     bool is_request = false;
 #ifdef LRPC_ENABLE_DIAGNOSTICS
     clock::time_point queued_at{};

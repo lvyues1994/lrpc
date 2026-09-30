@@ -24,6 +24,14 @@ extern "C" int LLVMFuzzerTestOneInput(std::uint8_t const *data, std::size_t size
         for (std::size_t i = 0; i < written.written; ++i)
             if (encoded[i] != data[i]) std::abort();
     } else if (frame.consumed != 0) std::abort();
+    w::limits bounds{4U * 1024U * 1024U, 64U * 1024U * 1024U,
+        w::streaming | w::message_compression | w::explicit_rejection};
+    auto const extended = w::decode_frame(input, bounds);
+    if (extended.code == w::error::none) {
+        std::array<std::uint8_t, 16> encoded{};
+        if (extended.consumed > size || w::encode_header(extended.value.header, {encoded.data(), encoded.size()}, bounds).code != w::error::none) std::abort();
+    } else if (extended.consumed != 0) std::abort();
+    w::decode_message_descriptor(input, bounds);
     w::decode_preface(input);
     w::decode_settings(input);
     w::decode_request_head(input, false);

@@ -74,9 +74,10 @@ def measured_command(invocation, config, args):
 
 def environment(binary):
     root = Path(__file__).resolve().parent.parent
-    files = [*root.glob("unary/**/*.cpp"), *root.glob("unary/**/*.hpp"), *root.glob("wire/**/*.cpp"),
-             *root.glob("wire/**/*.hpp"), *root.glob("benchmarks/*.cpp"), *root.glob("benchmarks/*.hpp"),
-             *root.glob("benchmarks/*.py"), root / "CMakeLists.txt", root / "CMakePresets.json"]
+    files = [p for directory in ("unary", "runtime", "message", "wire", "codec", "protobuf", "codegen", "benchmarks", "cmake")
+             for p in (root / directory).rglob("*") if p.is_file() and
+             (p.suffix in (".cpp", ".hpp", ".py", ".proto", ".cmake") or p.name == "CMakeLists.txt")]
+    files += [root / "CMakeLists.txt", root / "CMakePresets.json"]
     result = {"uname": platform.uname()._asdict(), "affinity": sorted(os.sched_getaffinity(0)),
               "lscpu": json.loads(command(["lscpu", "-J"])), "binary": str(binary.resolve()),
               "binary_sha256": hashlib.sha256(binary.read_bytes()).hexdigest(),
@@ -101,7 +102,7 @@ def environment(binary):
     if cache.get("CMAKE_CXX_COMPILER"):
         result["compiler"] = command([cache["CMAKE_CXX_COMPILER"], "--version"]).splitlines()[0]
     result["build_flags"] = {k: cache.get(k) for k in ("CMAKE_BUILD_TYPE", "CMAKE_CXX_FLAGS", "CMAKE_CXX_FLAGS_RELEASE",
-                                                     "LRPC_ENABLE_SANITIZERS", "LRPC_BENCH_COUNT_ALLOCATIONS", "LRPC_ENABLE_DIAGNOSTICS")}
+                                                     "LRPC_ENABLE_SANITIZERS", "LRPC_BENCH_COUNT_ALLOCATIONS", "LRPC_ENABLE_DIAGNOSTICS", "LRPC_ENABLE_COMPRESSION")}
     return result
 
 

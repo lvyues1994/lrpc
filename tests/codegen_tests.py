@@ -28,16 +28,22 @@ with tempfile.TemporaryDirectory(prefix="lrpc-codegen-") as directory:
     assert first == second and len(first) == 12
     assert b"delete_(" in first[pathlib.Path("echo.rpc.hpp")]
     assert b"::test::messages::Container_Item" in first[pathlib.Path("echo.rpc.hpp")]
+    assert b"add_Echo_service" in first[pathlib.Path("echo.rpc.hpp")]
+    assert b"channel.bind(::demo::Echo_service_descriptor())" in first[pathlib.Path("echo.rpc.cpp")]
+    for kind in (b"unary", b"client_streaming", b"server_streaming", b"bidirectional"):
+        assert b"::rpc::method_kind::" + kind in first[pathlib.Path("echo.rpc.cpp")]
+    assert b"::rpc::bind_stream_method" in first[pathlib.Path("echo.rpc.cpp")]
+    assert b"::rpc::open_stream<" in first[pathlib.Path("echo.rpc.cpp")]
 
     cases = [
-        ('message M{} service S {rpc X(stream M) returns(M);}', "streaming"),
-        ('message M{} service S {rpc X(M) returns(stream M);}', "streaming"),
-        ('message M{} service S {rpc X(stream M) returns(stream M);}', "streaming"),
+        ('message M{} service S {rpc delete(M) returns(M); rpc delete_(stream M) returns(stream M);}', "collision"),
         ('message M{} service S {rpc delete(M) returns(M); rpc delete_(M) returns(M);}', "collision"),
         ('message EchoService{} service Echo{}', "collision"),
         ('message Outer {message EchoService{}} service Outer_Echo{}', "collision"),
         ('enum E {EchoService=0;} service Echo{}', "collision"),
         ('enum Echo_service {ZERO=0;} service Echo{}', "collision"),
+        ('message add_Echo_service{} service Echo{}', "collision"),
+        ('message M{} service S{rpc lrpc_methods_(M) returns(M);}', "collision"),
         ('option cc_generic_services=true; service Echo{}', "cc_generic_services"),
     ]
     for index, (body, error) in enumerate(cases):
@@ -62,4 +68,4 @@ with tempfile.TemporaryDirectory(prefix="lrpc-codegen-") as directory:
     (root / "two.proto").write_text('syntax="proto3"; package p; service Outer_Echo{}')
     result = generate(root, root / "collision", ["one.proto", "two.proto"])
     assert result.returncode != 0 and "collision" in result.stderr
-print("PASS deterministic generation, imports, namespaces, collisions and unary-only validation")
+print("PASS deterministic generation, imports, namespaces, collisions and mixed RPC kinds")

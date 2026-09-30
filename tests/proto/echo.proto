@@ -15,3 +15,11 @@ service Echo {
   rpc delete(EchoRequest) returns (EchoReply);
 }
 service Empty {}
+service Mixed {
+  rpc Unary(EchoRequest) returns(EchoReply);
+  rpc Upload(stream EchoRequest) returns(EchoReply);
+  rpc Download(EchoRequest) returns(stream EchoReply);
+  rpc Chat(stream EchoRequest) returns(stream EchoReply);
+}
+// A valid method name must not shadow the descriptor used by the Stub ctor.
+service Shadow { rpc Shadow_service_descriptor(EchoRequest) returns(EchoReply); }
