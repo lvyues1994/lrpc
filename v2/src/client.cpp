@@ -236,6 +236,11 @@ bool client_core::on_frame(wire::frame_view const &frame) noexcept {
     auto const &header = frame.header;
     switch (header.type) {
     case wire::frame_type::end:
+        if (!(frame.head.size == 2 && frame.head.data[0] == 0 && frame.head.data[1] == 0)) {
+            auto const head = wire::decode_end_head(frame.head);
+            if (head.code != wire::error::none) return false;
+            if (header.aux == 0 && head.value.message.size != 0) return false; // Messages accompany errors only.
+        }
         if (auto *stream = streams.find(header.stream_id)) stream->ops->on_frame(*stream, frame);
         else if (header.stream_id >= next_id) return false; // Late ENDs of finished calls are expected.
         return true;

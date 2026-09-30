@@ -166,9 +166,23 @@ void connection::start(std::shared_ptr<void> keep) {
 parse_step connection::parse() noexcept {
     if (state_ == phase::handshaking) return handshake();
     auto const available = rx_end_ - rx_begin_;
-    auto const decoded = wire::decode_frame(
-        {rx_ + rx_begin_, available},
-        {options.receive.max_frame_size, std::numeric_limits<std::uint32_t>::max(), features_});
+    wire::limits const limits{options.receive.max_frame_size, std::numeric_limits<std::uint32_t>::max(), features_};
+    if (available >= wire::header_size) {
+        // REQUEST and END heads are validated once, by the role that reads
+        // them; every other frame goes through the full decoder.
+        auto const header = wire::decode_header({rx_ + rx_begin_, available}, limits);
+        if (header.code != wire::error::none) return step::failed;
+        auto const &h = header.value;
+        if (h.type == wire::frame_type::request || h.type == wire::frame_type::end) {
+            std::size_t const total = wire::header_size + h.length;
+            if (available < total) return prepare_receive(available);
+            auto *const head = rx_ + rx_begin_ + wire::header_size;
+            wire::frame_view const frame{h, {head, h.head_length}, {head + h.head_length, h.length - h.head_length}};
+            rx_begin_ += total;
+            return dispatch(frame) ? step::parsed : step::failed;
+        }
+    }
+    auto const decoded = wire::decode_frame({rx_ + rx_begin_, available}, limits);
     if (decoded.code == wire::error::none) {
         rx_begin_ += decoded.consumed;
         return dispatch(decoded.value) ? step::parsed : step::failed;

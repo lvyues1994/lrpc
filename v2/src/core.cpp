@@ -89,42 +89,47 @@ stream_table::stream_table(std::size_t const limit) : limit_(limit) {
 }
 
 stream_state *stream_table::find(std::uint32_t const id) const noexcept {
-    for (auto index = id & mask();; index = (index + 1) & mask()) {
+    std::size_t index = id & mask();
+    for (std::size_t probe = 0;; ++probe, index = (index + 1) & mask()) {
         auto const &slot = entries_[index];
-        if (slot.value == nullptr) return nullptr;
+        // Robin Hood order: past a richer entry, the key cannot follow.
+        if (slot.value == nullptr || distance(index, slot.id) < probe) return nullptr;
         if (slot.id == id) return slot.value;
     }
 }
 
 bool stream_table::insert(stream_state &value) noexcept {
-    if (size_ >= limit_) return false;
-    auto index = value.id & mask();
-    while (entries_[index].value != nullptr) {
-        if (entries_[index].id == value.id) return false;
-        index = (index + 1) & mask();
+    if (size_ >= limit_ || find(value.id) != nullptr) return false;
+    entry carried{value.id, &value};
+    std::size_t index = carried.id & mask();
+    for (std::size_t probe = 0;; ++probe, index = (index + 1) & mask()) {
+        auto &slot = entries_[index];
+        if (slot.value == nullptr) {
+            slot = carried;
+            ++size_;
+            return true;
+        }
+        auto const resident = distance(index, slot.id);
+        if (resident < probe) {
+            std::swap(slot, carried);
+            probe = resident;
+        }
     }
-    entries_[index] = {value.id, &value};
-    ++size_;
-    return true;
 }
 
 void stream_table::erase(std::uint32_t const id) noexcept {
-    auto hole = id & mask();
-    for (;; hole = (hole + 1) & mask()) {
-        if (entries_[hole].value == nullptr) return;
-        if (entries_[hole].id == id) break;
+    std::size_t hole = id & mask();
+    for (std::size_t probe = 0;; ++probe, hole = (hole + 1) & mask()) {
+        auto const &slot = entries_[hole];
+        if (slot.value == nullptr || distance(hole, slot.id) < probe) return;
+        if (slot.id == id) break;
     }
     --size_;
     for (auto next = (hole + 1) & mask();; next = (next + 1) & mask()) {
         auto const &candidate = entries_[next];
-        if (candidate.value == nullptr) break;
-        auto const home = candidate.id & mask();
-        // Move the entry into the hole unless its home lies cyclically in (hole, next].
-        auto const stays = hole <= next ? (home > hole && home <= next) : (home > hole || home <= next);
-        if (!stays) {
-            entries_[hole] = candidate;
-            hole = next;
-        }
+        if (candidate.value == nullptr || distance(next, candidate.id) == 0) break;
+        entries_[hole] = candidate;
+        hole = next;
     }
     entries_[hole] = {};
 }
@@ -166,7 +171,7 @@ void timing_wheel::unlink(wheel_node &node) noexcept {
 
 void timing_wheel::insert(wheel_node &node, std::uint64_t tick) noexcept {
     assert(!node.scheduled());
-    tick = std::max(tick, current_);
+    tick = std::max(tick, advancing_ ? current_ + 1 : current_);
     node.tick = tick;
     ++size_;
     if (tick - current_ < slots) {

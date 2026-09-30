@@ -129,9 +129,10 @@ private:
     std::size_t limit_;
 };
 
-// Fixed capacity, open addressing at load factor <= 1/2. Deletion shifts
-// entries back instead of leaving tombstones. Stream IDs are monotonic, so the
-// low bits are a good hash.
+// Fixed capacity, Robin Hood open addressing at load factor <= 1/2, with
+// backward-shift deletion. Stream IDs are monotonic, so the low bits are a
+// good hash and nearly every entry sits in its home slot: in-flight streams
+// form one long run, and deletion stops at the first entry already at home.
 class stream_table {
 public:
     explicit stream_table(std::size_t limit = 0);
@@ -149,6 +150,7 @@ private:
         stream_state *value = nullptr;
     };
     std::size_t mask() const noexcept { return entries_.size() - 1; }
+    std::size_t distance(std::size_t index, std::uint32_t id) const noexcept { return (index - id) & mask(); }
     std::vector<entry> entries_;
     std::size_t limit_ = 0;
     std::size_t size_ = 0;
@@ -165,7 +167,9 @@ public:
     timing_wheel(timing_wheel const &) = delete;
     timing_wheel &operator=(timing_wheel const &) = delete;
 
-    void insert(wheel_node &node, std::uint64_t tick) noexcept; // A past tick expires next.
+    // A due tick is moved past the tick being expired, so an expiry callback
+    // that schedules again cannot livelock the running advance.
+    void insert(wheel_node &node, std::uint64_t tick) noexcept;
     void erase(wheel_node &node) noexcept;
     bool empty() const noexcept { return size_ == 0; }
     std::uint64_t next_tick() const noexcept; // Requires !empty(); never later than the earliest node.
@@ -188,9 +192,11 @@ private:
     std::uint64_t current_ = 0; // First tick not yet processed.
     std::size_t size_ = 0;
     std::size_t overflow_size_ = 0;
+    bool advancing_ = false; // The slot of current_ is being expired.
 };
 
 template <class Expire> void timing_wheel::advance(std::uint64_t const now_tick, Expire expire) {
+    advancing_ = true;
     while (current_ <= now_tick && size_ != 0) {
         auto const slot = static_cast<std::size_t>(current_ % slots);
         if (marked(slot)) {
@@ -206,6 +212,7 @@ template <class Expire> void timing_wheel::advance(std::uint64_t const now_tick,
         ++current_;
         if (overflow_size_ != 0 && current_ + slots > overflow_min_) rebucket();
     }
+    advancing_ = false;
     if (size_ == 0 && current_ <= now_tick) current_ = now_tick + 1;
 }
 
