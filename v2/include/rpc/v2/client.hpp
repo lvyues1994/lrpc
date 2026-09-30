@@ -26,6 +26,15 @@ struct call_result {
     std::size_t size = 0; // Response bytes written into the caller's buffer.
 };
 
+// Receives the status message and metadata of a response. The views point
+// into storage; truncated means they did not fit and were dropped.
+struct response_trailer {
+    wire::mutable_bytes_view storage{};
+    wire::bytes_view message{};
+    wire::metadata_view metadata{};
+    bool truncated = false;
+};
+
 // A method bound to one client; bind() is the only (cold) string lookup.
 struct method_ref {
     std::uint32_t index = 0; // One-based.
@@ -45,8 +54,9 @@ struct call_access;
 // The complete state of one unary call. It is an IoAwaitable that lives in
 // the awaiting coroutine's frame, so issuing a call allocates nothing. Await
 // it on the client's shard; request, response and spec are borrowed until it
-// completes. The caller may resume inline from the connection's reader. A
-// stop request may come from any thread.
+// completes, and so is the trailer if one is given. The caller may resume
+// inline from the connection's reader. A stop request may come from any
+// thread.
 class unary_call : detail::stream_state {
 public:
     unary_call(unary_call &&other) noexcept; // Only before it is awaited.
@@ -62,12 +72,13 @@ private:
     friend class client;
     friend struct detail::call_access;
     unary_call(detail::client_core *core, std::uint32_t method, wire::bytes_view request,
-               wire::mutable_bytes_view response, call_spec const *spec) noexcept;
+               wire::mutable_bytes_view response, call_spec const *spec, response_trailer *trailer) noexcept;
 
     detail::client_core *core_;
     wire::bytes_view request_;
     wire::mutable_bytes_view response_;
     call_spec const *spec_;
+    response_trailer *trailer_;
     net::continuation continuation_{};
     net::io_env const *env_ = nullptr;
     detail::stop_hook *hook_ = nullptr;
@@ -93,8 +104,8 @@ public:
     net::task<status_code> attach(std::unique_ptr<transport> link);
     method_ref bind(std::string const &name);
     unary_call call(method_ref method, wire::bytes_view request, wire::mutable_bytes_view response,
-                    call_spec const *spec = nullptr) noexcept {
-        return unary_call{core_.get(), method.index, request, response, spec};
+                    call_spec const *spec = nullptr, response_trailer *trailer = nullptr) noexcept {
+        return unary_call{core_.get(), method.index, request, response, spec, trailer};
     }
     bool ready() const noexcept;
     std::size_t pending() const noexcept;

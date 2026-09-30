@@ -36,6 +36,10 @@ public:
     wire::mutable_bytes_view prepare(std::size_t size) noexcept; // Empty on failure.
     bool commit(std::size_t size) noexcept;
     std::size_t size() const noexcept;
+    // Metadata sent with any status, and a message sent only with an error.
+    // Copied at once and bounded by the method's max_trailer_bytes; a later
+    // call replaces an earlier one.
+    bool set_trailer(wire::bytes_view message, wire::metadata_list metadata = {}) noexcept;
 
 private:
     friend struct detail::server_access;
@@ -52,9 +56,10 @@ struct method_handler {
 struct method_binding {
     std::string name{};
     method_handler *handler = nullptr; // Borrowed until the server has drained.
-    // Charged to the response ledger for every admitted call, so it bounds
-    // concurrency as well as the reply.
+    // Both are charged to the response ledger for every admitted call, so
+    // they bound concurrency as well as the reply.
     std::size_t max_response_bytes = 0;
+    std::size_t max_trailer_bytes = 0; // Encoded END head; zero allows no trailer.
 };
 
 struct server_options {

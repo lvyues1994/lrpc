@@ -93,8 +93,20 @@ struct call_access {
         if (auto &conn = call.core_->conn) conn->send_control(wire::frame_type::cancel, call.id, 0, 0);
     }
 
+    static void keep_trailer(response_trailer &trailer, wire::bytes_view const head) noexcept {
+        if (head.size > trailer.storage.size) {
+            trailer.truncated = true;
+            return;
+        }
+        std::memcpy(trailer.storage.data, head.data, head.size);
+        auto const decoded = wire::decode_end_head({trailer.storage.data, head.size}).value; // Frame-validated.
+        trailer.message = decoded.message;
+        trailer.metadata = decoded.metadata;
+    }
+
     static void on_frame(stream_state &stream, wire::frame_view const &frame) noexcept {
         auto &call = of(stream);
+        if (call.trailer_ != nullptr && frame.head.size > 2) keep_trailer(*call.trailer_, frame.head);
         auto code = static_cast<status_code>(frame.header.aux);
         if (code == status_code::ok) {
             if (frame.body.size > call.response_.size) {
@@ -138,6 +150,11 @@ std::uint64_t remaining_us(clock::duration const remaining) noexcept {
 } // namespace
 
 status_code call_access::start(unary_call &call) noexcept {
+    if (auto *const trailer = call.trailer_) {
+        trailer->message = {};
+        trailer->metadata = {};
+        trailer->truncated = false;
+    }
     auto *const core = call.core_;
     if (core == nullptr || !core->ready()) return status_code::unavailable;
     if (call.method_ == 0 || call.method_ > core->methods.size()) return status_code::invalid_argument;
@@ -307,12 +324,12 @@ CO2_END
 } // namespace detail
 
 unary_call::unary_call(detail::client_core *core, std::uint32_t method, wire::bytes_view request,
-                       wire::mutable_bytes_view response, call_spec const *spec) noexcept
-    : core_(core), request_(request), response_(response), spec_(spec), method_(method) {}
+                       wire::mutable_bytes_view response, call_spec const *spec, response_trailer *trailer) noexcept
+    : core_(core), request_(request), response_(response), spec_(spec), trailer_(trailer), method_(method) {}
 
 unary_call::unary_call(unary_call &&other) noexcept
     : detail::stream_state(), core_(other.core_), request_(other.request_), response_(other.response_),
-      spec_(other.spec_), method_(other.method_) {
+      spec_(other.spec_), trailer_(other.trailer_), method_(other.method_) {
     assert(other.phase_ == detail::call_idle);
 }
 

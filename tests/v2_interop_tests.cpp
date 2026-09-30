@@ -9,7 +9,9 @@
 #include <net/run_async.hpp>
 
 #include <array>
+#include <cstring>
 #include <iostream>
+#include <string>
 
 namespace {
 
@@ -42,20 +44,53 @@ struct v2_handler final : v2::method_handler {
     }
 };
 
+bytes_view text(char const *value) noexcept {
+    return {reinterpret_cast<std::uint8_t const *>(value), std::strlen(value)};
+}
+std::string text(bytes_view value) { return {reinterpret_cast<char const *>(value.data), value.size}; }
+
+auto v1_refuse(rpc::server_context &context) CO2_BEG(net::task<rpc::status_code>, (context)) {
+    CO2_RETURN(rpc::set_status(context, {rpc::status_code::failed_precondition, "v1 says no"}));
+}
+CO2_END
+
+struct v1_refusing final : rpc::method_handler {
+    net::task<rpc::status_code> invoke(rpc::server_context &context, bytes_view, rpc::response_writer &) override {
+        return v1_refuse(context);
+    }
+};
+
+auto v2_refuse(v2::response_writer &response) CO2_BEG(net::task<v2::status_code>, (response)) {
+    static rpc::wire::metadata_entry const entries[] = {{text("k"), text("v")}};
+    CO2_RETURN(response.set_trailer(text("v2 says no"), {entries, 1}) ? v2::status_code::failed_precondition
+                                                                       : v2::status_code::internal);
+}
+CO2_END
+
+struct v2_refusing final : v2::method_handler {
+    net::task<v2::status_code> invoke(v2::server_context &, bytes_view, v2::response_writer &response) override {
+        return v2_refuse(response);
+    }
+};
+
 struct fixture {
     net::io_context context{selected_backend, net::single_thread_hint};
     v2::shard shard{context};
     v1_handler old_handler{};
+    v1_refusing old_refusing{};
     v2_handler new_handler{};
-    std::unique_ptr<rpc::server> old_server{rpc::make_server(context, {{"interop/Echo", 256, &old_handler}})};
-    v2::server new_server{shard, {{"interop/Echo", &new_handler, 256}}};
+    v2_refusing new_refusing{};
+    std::unique_ptr<rpc::server> old_server{
+        rpc::make_server(context, {{"interop/Echo", 256, &old_handler}, {"interop/Refuse", 0, &old_refusing, 64}})};
+    v2::server new_server{shard, {{"interop/Echo", &new_handler, 256}, {"interop/Refuse", &new_refusing, 0, 64}}};
     std::unique_ptr<rpc::client> old_client{rpc::make_client(context)};
     v2::client new_client{shard};
 };
 
 auto exercise(fixture &f)
     CO2_BEG(net::task<>, (f), v2::status_code connected; rpc::status_code old_connected; v2::call_result result;
-            rpc::call_result old_result; v2::method_ref echo; v2::method_ref missing;
+            rpc::call_result old_result; v2::method_ref echo; v2::method_ref missing; v2::method_ref refuse;
+            v2::response_trailer trailer; std::array<std::uint8_t, 64> storage{}; rpc::call_options options;
             std::array<std::uint8_t, 48> request{}; std::array<std::uint8_t, 48> response{}; int i = 0;) {
     request.fill(0x3c);
     CO2_AWAIT_SET(connected, f.new_client.connect(f.old_server->listen({net::ip::address_v4::loopback(), 0})));
@@ -69,6 +104,10 @@ auto exercise(fixture &f)
     }
     CO2_AWAIT_SET(result, f.new_client.call(missing, {}, {}));
     CHECK(result.code == v2::status_code::unimplemented);
+    refuse = f.new_client.bind("interop/Refuse");
+    trailer.storage = {storage.data(), storage.size()};
+    CO2_AWAIT_SET(result, f.new_client.call(refuse, {}, {}, nullptr, &trailer));
+    CHECK(result.code == v2::status_code::failed_precondition && text(trailer.message) == "v1 says no");
 
     CO2_AWAIT_SET(old_connected, f.old_client->connect(f.new_server.listen({net::ip::address_v4::loopback(), 0})));
     CHECK(old_connected == rpc::status_code::ok);
@@ -80,6 +119,10 @@ auto exercise(fixture &f)
     }
     CO2_AWAIT_SET(old_result, f.old_client->call("interop/Missing", {}, {}));
     CHECK(old_result.code == rpc::status_code::unimplemented);
+    options.response_metadata = {storage.data(), storage.size()};
+    CO2_AWAIT_SET(old_result, f.old_client->call("interop/Refuse", {}, {}, options));
+    CHECK(old_result.code == rpc::status_code::failed_precondition && old_result.message == "v2 says no");
+    CHECK(old_result.response_metadata.count == 1);
     CO2_RETURN();
 }
 CO2_END

@@ -7,6 +7,7 @@
 #include <net/run_async.hpp>
 
 #include <algorithm>
+#include <array>
 #include <cstring>
 #include <new>
 #include <stdexcept>
@@ -26,6 +27,9 @@ struct method_entry {
     std::string name;
     method_handler *handler;
     std::size_t max_response;
+    std::size_t max_trailer;
+    std::size_t max_head() const noexcept { return std::max(max_trailer, end_head_bytes); }
+    std::size_t charge() const noexcept { return max_response + max_trailer; }
 };
 
 struct server_core;
@@ -45,6 +49,9 @@ struct server_call final : stream_state {
     std::uint8_t *response_block = nullptr;
     std::size_t response_capacity = 0;
     std::size_t response_size = 0;
+    std::uint8_t *trailer_block = nullptr; // Encoded END head, max_trailer bytes.
+    std::size_t trailer_size = 0;
+    std::size_t trailer_metadata = 0; // Offset of the metadata block, after the message.
     server_context context{};
     response_writer writer{};
     // Reused while no stop was requested; the context documents that its
@@ -178,10 +185,12 @@ server_core::server_core(shard_state &state, std::vector<method_binding> binding
     : shard(state), options(config), frame_allocator(state.context.get_frame_allocator()) {
     methods.reserve(bindings.size());
     for (auto &binding : bindings) {
-        if (binding.name.empty() || binding.handler == nullptr) throw std::invalid_argument{"invalid method binding"};
+        if (binding.name.empty() || binding.handler == nullptr || binding.max_trailer_bytes > 0xffffU)
+            throw std::invalid_argument{"invalid method binding"};
         for (auto const &existing : methods)
             if (existing.name == binding.name) throw std::invalid_argument{"duplicate method " + binding.name};
-        methods.push_back(method_entry{std::move(binding.name), binding.handler, binding.max_response_bytes});
+        methods.push_back(method_entry{std::move(binding.name), binding.handler, binding.max_response_bytes,
+                                       binding.max_trailer_bytes});
     }
     shard.endpoint_opened();
 }
@@ -212,8 +221,10 @@ server_call &server_core::acquire_call() {
 void server_core::release_call(server_call &call) noexcept {
     shard.memory.deallocate(call.request_block, call.request_capacity);
     shard.memory.deallocate(call.response_block, call.response_capacity);
-    call.request_block = call.response_block = nullptr;
+    if (call.trailer_block != nullptr) shard.memory.deallocate(call.trailer_block, call.method->max_trailer);
+    call.request_block = call.response_block = call.trailer_block = nullptr;
     call.request_capacity = call.response_capacity = call.response_size = call.request_charge = 0;
+    call.trailer_size = 0;
     call.request = {};
     call.context.deadline = clock::time_point::max();
     call.context.metadata = {};
@@ -346,9 +357,10 @@ bool session::on_request(wire::frame_view const &frame) noexcept {
     auto const &limits = core->options;
     auto &stats = core->stats;
     if (frame.body.size > conn.options.receive.max_message_size || entry.max_response > peer.max_message_size ||
-        entry.max_response > peer.max_frame_size - end_head_bytes || streams.size() >= streams.limit() ||
-        stats.active_calls >= limits.max_active_calls || header.length > limits.max_request_bytes - stats.request_bytes ||
-        entry.max_response > limits.max_response_bytes - stats.response_bytes)
+        entry.max_head() > peer.max_frame_size || entry.max_response > peer.max_frame_size - entry.max_head() ||
+        streams.size() >= streams.limit() || stats.active_calls >= limits.max_active_calls ||
+        header.length > limits.max_request_bytes - stats.request_bytes ||
+        entry.charge() > limits.max_response_bytes - stats.response_bytes)
         return reject(header.stream_id, status_code::resource_exhausted), true;
 
     auto deadline = clock::time_point::max();
@@ -393,7 +405,7 @@ bool session::on_request(wire::frame_view const &frame) noexcept {
     ++active;
     ++stats.active_calls;
     stats.request_bytes += header.length;
-    stats.response_bytes += entry.max_response;
+    stats.response_bytes += entry.charge();
     last_admitted = header.stream_id;
     if (deadline != clock::time_point::max()) core->shard.schedule(*call, deadline);
     invoke(*call);
@@ -424,8 +436,12 @@ void session::invoke(server_call &call) noexcept {
 }
 
 void session::send_end(server_call &call, status_code const code) noexcept {
-    std::size_t const body = code == status_code::ok ? call.response_size : 0;
-    std::size_t const payload = end_head_bytes + body;
+    bool const ok = code == status_code::ok;
+    std::size_t const body = ok ? call.response_size : 0;
+    // The wire carries a status message only with an error: ok keeps just the metadata.
+    std::size_t const skipped = ok && call.trailer_size != 0 ? call.trailer_metadata - 1 : 0;
+    std::size_t const head = call.trailer_size != 0 ? call.trailer_size - skipped : end_head_bytes;
+    std::size_t const payload = head + body;
     std::uint8_t *frame = nullptr;
     try {
         frame = conn.reserve(wire::header_size + payload);
@@ -437,14 +453,21 @@ void session::send_end(server_call &call, status_code const code) noexcept {
     header.length = static_cast<std::uint32_t>(payload);
     header.stream_id = call.id;
     header.type = wire::frame_type::end;
-    header.head_length = static_cast<std::uint16_t>(end_head_bytes);
+    header.head_length = static_cast<std::uint16_t>(head);
     header.aux = static_cast<std::uint32_t>(code);
     if (wire::encode_header(header, {frame, wire::header_size}, conn.outgoing()).code != wire::error::none) {
         conn.close();
         return;
     }
-    frame[16] = frame[17] = 0;
-    if (body != 0) std::memcpy(frame + wire::header_size + end_head_bytes, call.response_block, body);
+    if (call.trailer_size == 0) {
+        frame[16] = frame[17] = 0;
+    } else if (skipped == 0) {
+        std::memcpy(frame + wire::header_size, call.trailer_block, head);
+    } else {
+        frame[16] = 0; // Empty message.
+        std::memcpy(frame + wire::header_size + 1, call.trailer_block + call.trailer_metadata, head - 1);
+    }
+    if (body != 0) std::memcpy(frame + wire::header_size + head, call.response_block, body);
     conn.commit(wire::header_size + payload);
 }
 
@@ -457,7 +480,7 @@ void session::complete(server_call &call, status_code code) noexcept {
     auto &stats = core->stats;
     --stats.active_calls;
     stats.request_bytes -= call.request_charge;
-    stats.response_bytes -= call.method->max_response;
+    stats.response_bytes -= call.method->charge();
     core->release_call(call);
     --active;
     if (goaway_sent && active == 0) conn.close_when_flushed();
@@ -547,6 +570,25 @@ bool response_writer::assign(wire::bytes_view const bytes) noexcept {
 }
 
 std::size_t response_writer::size() const noexcept { return call_ != nullptr ? call_->response_size : 0; }
+
+bool response_writer::set_trailer(wire::bytes_view const message, wire::metadata_list const metadata) noexcept {
+    auto *const call = call_;
+    if (call == nullptr || call->method == nullptr || call->method->max_trailer == 0) return false;
+    auto const limit = call->method->max_trailer;
+    if (call->trailer_block == nullptr) {
+        try {
+            call->trailer_block = call->core->shard.memory.allocate(limit);
+        } catch (std::bad_alloc const &) {
+            return false;
+        }
+    }
+    auto const encoded = wire::encode_end_head({message, metadata}, {call->trailer_block, limit});
+    std::array<std::uint8_t, 10> length{};
+    auto const prefix = wire::encode_varint(message.size, {length.data(), length.size()});
+    call->trailer_size = encoded.code == wire::error::none ? encoded.written : 0;
+    call->trailer_metadata = prefix.written + message.size;
+    return call->trailer_size != 0;
+}
 
 // ---- server ----
 

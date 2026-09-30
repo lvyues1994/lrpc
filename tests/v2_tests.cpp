@@ -11,7 +11,9 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cstring>
 #include <iostream>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -34,8 +36,14 @@ struct echo_handler final : v2::method_handler {
     bool delayed = false; // Sleep request[0] milliseconds.
     bool hang = false;    // Sleep until stopped.
     bool doubled = false; // Reply twice the request, exceeding small method limits.
+    int trailer = 0;      // 1: metadata with ok, 2: message with an error, 3: oversized.
     std::vector<unsigned> order{};
 };
+
+bytes_view text(char const *value) noexcept {
+    return {reinterpret_cast<std::uint8_t const *>(value), std::strlen(value)};
+}
+std::string text(bytes_view value) { return {reinterpret_cast<char const *>(value.data), value.size}; }
 
 auto echo(echo_handler &self, v2::server_context &context, bytes_view request, v2::response_writer &response)
     CO2_BEG(net::task<v2::status_code>, (self, context, request, response), net::io_result<> slept;
@@ -53,6 +61,16 @@ auto echo(echo_handler &self, v2::server_context &context, bytes_view request, v
         CO2_RETURN(v2::status_code::cancelled);
     }
     if (request.size != 0) self.order.push_back(request.data[0]);
+    if (self.trailer == 1) {
+        static rpc::wire::metadata_entry const entries[] = {{text("k"), text("v")}};
+        CHECK(response.set_trailer(text("ok-note"), {entries, 1}));
+    } else if (self.trailer == 2) {
+        CHECK(response.set_trailer(text("bad input")));
+        CO2_RETURN(v2::status_code::invalid_argument);
+    } else if (self.trailer == 3) {
+        twice.assign(200, std::uint8_t{'x'});
+        if (!response.set_trailer({twice.data(), twice.size()})) CO2_RETURN(v2::status_code::internal);
+    }
     if (self.doubled) {
         twice.assign(request.data, request.data + request.size);
         twice.insert(twice.end(), request.data, request.data + request.size);
@@ -79,8 +97,8 @@ CO2_END
 
 struct fixture {
     explicit fixture(v2::server_options server_config = {}, v2::client_options client_config = {},
-                     std::size_t response_limit = max_response)
-        : shard(context), server(shard, {{"test/Echo", &handler, response_limit}}, server_config),
+                     std::size_t response_limit = max_response, std::size_t trailer_limit = 0)
+        : shard(context), server(shard, {{"test/Echo", &handler, response_limit, trailer_limit}}, server_config),
           client(shard, client_config), endpoint(server.listen({net::ip::address_v4::loopback(), 0})),
           echo_method(client.bind("test/Echo")) {}
 
@@ -186,6 +204,45 @@ auto response_limit(fixture &f)
     CO2_AWAIT_SET(result, f.client.call(f.echo_method, {request.data(), request.size()},
                                         {response.data(), response.size()}));
     CHECK(result.code == v2::status_code::ok && result.size == request.size());
+    CO2_RETURN();
+}
+CO2_END
+
+auto trailers(fixture &f)
+    CO2_BEG(net::task<>, (f), v2::status_code connected; v2::call_result result; v2::response_trailer trailer;
+            std::array<std::uint8_t, 128> storage{}; std::array<std::uint8_t, 4> tiny{};
+            std::array<std::uint8_t, 8> request{}; std::array<std::uint8_t, 8> response{};
+            rpc::wire::decode_result<rpc::wire::metadata_entry> entry;) {
+    CO2_AWAIT_SET(connected, f.client.connect(f.endpoint));
+    CHECK(connected == v2::status_code::ok);
+    request.fill(9);
+    trailer.storage = {storage.data(), storage.size()};
+    f.handler.trailer = 1;
+    CO2_AWAIT_SET(result, f.client.call(f.echo_method, {request.data(), request.size()},
+                                        {response.data(), response.size()}, nullptr, &trailer));
+    CHECK(result.code == v2::status_code::ok && result.size == request.size() && response == request);
+    // The wire carries a status message only with an error.
+    CHECK(trailer.message.size == 0 && trailer.metadata.count == 1 && !trailer.truncated);
+    entry = rpc::wire::decode_metadata_entry(trailer.metadata.entries);
+    CHECK(entry.code == rpc::wire::error::none && text(entry.value.key) == "k" && text(entry.value.value) == "v");
+
+    f.handler.trailer = 2;
+    CO2_AWAIT_SET(result, f.client.call(f.echo_method, {}, {}, nullptr, &trailer));
+    CHECK(result.code == v2::status_code::invalid_argument);
+    CHECK(text(trailer.message) == "bad input" && trailer.metadata.count == 0);
+    trailer.storage = {tiny.data(), tiny.size()};
+    CO2_AWAIT_SET(result, f.client.call(f.echo_method, {}, {}, nullptr, &trailer));
+    CHECK(result.code == v2::status_code::invalid_argument && trailer.truncated && trailer.message.size == 0);
+    CO2_AWAIT_SET(result, f.client.call(f.echo_method, {}, {}));
+    CHECK(result.code == v2::status_code::invalid_argument);
+
+    f.handler.trailer = 3; // Beyond the method's 64-byte trailer limit.
+    trailer.storage = {storage.data(), storage.size()};
+    CO2_AWAIT_SET(result, f.client.call(f.echo_method, {}, {}, nullptr, &trailer));
+    CHECK(result.code == v2::status_code::internal && trailer.message.size == 0 && !trailer.truncated);
+    f.handler.trailer = 0;
+    CO2_AWAIT_SET(result, f.client.call(f.echo_method, {}, {}, nullptr, &trailer));
+    CHECK(result.code == v2::status_code::ok && trailer.message.size == 0 && trailer.metadata.count == 0);
     CO2_RETURN();
 }
 CO2_END
@@ -463,6 +520,7 @@ int main(int argc, char **argv) {
         }
         { fixture f; f.run([&] { return basic(f); }); std::cout << "PASS basic/unknown/small buffer/exception\n"; }
         { fixture f{{}, {}, 48}; f.run([&] { return response_limit(f); }); std::cout << "PASS declared response limit\n"; }
+        { fixture f{{}, {}, 64, 64}; f.run([&] { return trailers(f); }); std::cout << "PASS status message and metadata\n"; }
         { fixture f; f.run([&] { return concurrent(f); }); std::cout << "PASS multiplexed reverse completion\n"; }
         { fixture f; f.run([&] { return large(f); }); std::cout << "PASS large frames beyond the window\n"; }
         { fixture f; f.run([&] { return deadlines(f); }); std::cout << "PASS deadlines and server cancel\n"; }
