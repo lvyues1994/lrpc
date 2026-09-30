@@ -139,7 +139,7 @@ server_call &call_of(stream_state &stream) noexcept { return static_cast<server_
 
 void call_frame(stream_state &, wire::frame_view const &) noexcept {}
 
-void call_abort(stream_state &stream, status_code const code) noexcept {
+void call_abort(stream_state &stream, status_code const code, bool) noexcept {
     auto &call = call_of(stream);
     call.detached = true;
     call.owner->streams.erase(call.id);
@@ -495,7 +495,7 @@ void session::goaway() noexcept {
 }
 
 void session::on_closed() noexcept {
-    while (auto *stream = streams.any()) stream->ops->on_abort(*stream, status_code::unavailable);
+    while (auto *stream = streams.any()) stream->ops->on_abort(*stream, status_code::unavailable, false);
 }
 
 void session::on_finished() noexcept {

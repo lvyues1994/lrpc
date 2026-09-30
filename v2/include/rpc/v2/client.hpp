@@ -24,6 +24,9 @@ struct call_spec {
 struct call_result {
     status_code code = status_code::unknown;
     std::size_t size = 0; // Response bytes written into the caller's buffer.
+    // The server provably did not run the call: it failed before sending,
+    // or the server said so. Such a call is safe to retry.
+    bool not_executed = false;
 };
 
 // Receives the status message and metadata of a response. The views point
@@ -47,9 +50,12 @@ struct client_options {
 
 namespace detail {
 struct client_core;
+struct call_router;
 struct stop_hook;
 struct call_access;
 } // namespace detail
+
+class channel;
 
 // The complete state of one unary call. It is an IoAwaitable that lives in
 // the awaiting coroutine's frame, so issuing a call allocates nothing. Await
@@ -70,11 +76,14 @@ public:
 
 private:
     friend class client;
+    friend class channel;
     friend struct detail::call_access;
-    unary_call(detail::client_core *core, std::uint32_t method, wire::bytes_view request,
-               wire::mutable_bytes_view response, call_spec const *spec, response_trailer *trailer) noexcept;
+    unary_call(detail::client_core *core, detail::call_router *router, std::uint32_t method,
+               wire::bytes_view request, wire::mutable_bytes_view response, call_spec const *spec,
+               response_trailer *trailer) noexcept;
 
-    detail::client_core *core_;
+    detail::client_core *core_; // Of the current attempt; a router picks it.
+    detail::call_router *router_;
     wire::bytes_view request_;
     wire::mutable_bytes_view response_;
     call_spec const *spec_;
@@ -82,9 +91,12 @@ private:
     net::continuation continuation_{};
     net::io_env const *env_ = nullptr;
     detail::stop_hook *hook_ = nullptr;
+    clock::time_point deadline_ = clock::time_point::min(); // Fixed by the first attempt.
     std::uint32_t method_;
     std::uint32_t size_ = 0;
     std::uint8_t phase_ = 0;
+    std::uint8_t attempts_ = 0;
+    bool not_executed_ = false;
     status_code code_ = status_code::unknown;
 };
 
@@ -105,7 +117,7 @@ public:
     method_ref bind(std::string const &name);
     unary_call call(method_ref method, wire::bytes_view request, wire::mutable_bytes_view response,
                     call_spec const *spec = nullptr, response_trailer *trailer = nullptr) noexcept {
-        return unary_call{core_.get(), method.index, request, response, spec, trailer};
+        return unary_call{core_.get(), nullptr, method.index, request, response, spec, trailer};
     }
     bool ready() const noexcept;
     std::size_t pending() const noexcept;

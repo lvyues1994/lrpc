@@ -1,6 +1,4 @@
-#include <rpc/v2/client.hpp>
-
-#include "engine.hpp"
+#include "client_core.hpp"
 
 #include <net/error.hpp>
 #include <net/timeout.hpp>
@@ -19,68 +17,51 @@ namespace detail {
 namespace {
 // Bounds the table a client allocates for what the server advertises.
 constexpr std::size_t max_tracked_streams = 1U << 16;
-enum : std::uint8_t { call_idle = 0, call_pending = 1, call_done = 2 };
+
+bool retryable(status_code const code) noexcept {
+    return code == status_code::unavailable || code == status_code::resource_exhausted;
+}
 } // namespace
-
-struct method_slot {
-    std::string name;
-    bool interned = false; // NEW_METHOD has been queued on this connection.
-};
-
-struct client_core final : connection_handler {
-    client_core(shard_state &state, client_options const &config) : shard(state), options(config) {
-        shard.endpoint_opened();
-    }
-    ~client_core() { end_endpoint(); }
-
-    bool on_frame(wire::frame_view const &frame) noexcept override;
-    void on_ready() noexcept override;
-    void on_closed() noexcept override;
-    void on_finished() noexcept override {}
-
-    bool ready() const noexcept { return conn && conn->ready() && !going_away; }
-    void close() noexcept {
-        closed = true;
-        if (conn) conn->close();
-        end_endpoint();
-    }
-    void end_endpoint() noexcept {
-        if (!endpoint_open) return;
-        endpoint_open = false;
-        shard.endpoint_closed();
-    }
-    void settle() noexcept {
-        if (going_away && streams.size() == 0 && conn) conn->close_when_flushed();
-    }
-
-    shard_state &shard;
-    client_options const options;
-    std::unique_ptr<connection> conn;
-    stream_table streams;
-    std::vector<method_slot> methods;
-    std::uint32_t next_id = 1;
-    bool going_away = false;
-    bool handshake_done = false;
-    bool closed = false;
-    bool endpoint_open = true;
-    event ready_event;
-    status_code connect_status = status_code::unavailable;
-};
 
 struct call_access {
     static unary_call &of(stream_state &stream) noexcept { return static_cast<unary_call &>(stream); }
 
+    // Starts attempts until one is in flight. Every failure here happened
+    // before sending, so a router may try another connection.
+    static status_code launch(unary_call &call, client_core const *avoid) noexcept {
+        for (;;) {
+            if (call.router_ != nullptr) {
+                call.core_ = call.router_->pick(avoid);
+                if (call.core_ == nullptr) return status_code::unavailable;
+            }
+            auto const code = start(call);
+            if (code == status_code::ok) return code;
+            if (call.router_ == nullptr || !retryable(code) || ++call.attempts_ >= call.router_->max_attempts())
+                return code;
+            avoid = call.core_;
+        }
+    }
+
     // From the reader the caller resumes inline: the reader keeps the core
     // alive and the writer is still posted, so a burst of responses still
     // leaves as one write. Other paths post.
-    static void finish(unary_call &call, status_code const code, bool const from_reader = false) noexcept {
+    static void finish(unary_call &call, status_code code, bool const not_executed,
+                       bool const from_reader = false) noexcept {
         if (call.phase_ != call_pending) return;
         auto &core = *call.core_;
         core.streams.erase(call.id);
         core.shard.unschedule(call);
-        call.code_ = code;
-        call.phase_ = call_done;
         core.settle();
+        if (not_executed && call.router_ != nullptr && retryable(code) &&
+            ++call.attempts_ < call.router_->max_attempts()) {
+            call.phase_ = call_idle;
+            auto const again = launch(call, &core);
+            if (again == status_code::ok) return;
+            code = again;
+        }
+        call.code_ = code;
+        call.not_executed_ = not_executed;
+        call.phase_ = call_done;
         if (!from_reader) {
             call.env_->executor.post(call.continuation_);
             return;
@@ -99,7 +80,7 @@ struct call_access {
             return;
         }
         std::memcpy(trailer.storage.data, head.data, head.size);
-        auto const decoded = wire::decode_end_head({trailer.storage.data, head.size}).value; // Frame-validated.
+        auto const decoded = wire::decode_end_head({trailer.storage.data, head.size}).value; // Validated.
         trailer.message = decoded.message;
         trailer.metadata = decoded.metadata;
     }
@@ -116,22 +97,24 @@ struct call_access {
                 call.size_ = static_cast<std::uint32_t>(frame.body.size);
             }
         }
-        finish(call, code, true);
+        finish(call, code, (frame.header.flags & wire::not_executed) != 0, true);
     }
 
-    static void on_abort(stream_state &stream, status_code const code) noexcept { finish(of(stream), code); }
+    static void on_abort(stream_state &stream, status_code const code, bool const not_executed) noexcept {
+        finish(of(stream), code, not_executed);
+    }
 
     static void on_deadline(stream_state &stream) noexcept {
         auto &call = of(stream);
         send_cancel(call);
-        finish(call, status_code::deadline_exceeded);
+        finish(call, status_code::deadline_exceeded, false);
     }
 
     static void on_cancel(stream_state &stream) noexcept {
         auto &call = of(stream);
         if (call.phase_ != call_pending) return;
         send_cancel(call);
-        finish(call, status_code::cancelled);
+        finish(call, status_code::cancelled, false);
     }
 
     static status_code start(unary_call &call) noexcept;
@@ -150,19 +133,14 @@ std::uint64_t remaining_us(clock::duration const remaining) noexcept {
 } // namespace
 
 status_code call_access::start(unary_call &call) noexcept {
-    if (auto *const trailer = call.trailer_) {
-        trailer->message = {};
-        trailer->metadata = {};
-        trailer->truncated = false;
-    }
+    auto const &env = *call.env_;
+    if (env.stop_token.stop_requested()) return status_code::cancelled;
     auto *const core = call.core_;
     if (core == nullptr || !core->ready()) return status_code::unavailable;
     if (call.method_ == 0 || call.method_ > core->methods.size()) return status_code::invalid_argument;
-    auto const &env = *call.env_;
-    if (env.stop_token.stop_requested()) return status_code::cancelled;
     auto &conn = *core->conn;
     auto const &peer = conn.peer();
-    if (call.method_ > peer.max_method_ids || core->streams.size() >= core->streams.limit() ||
+    if (call.method_ > peer.max_method_ids || !core->has_room() ||
         conn.queued_bytes() > conn.options.tx_high_watermark || call.request_.size > peer.max_message_size)
         return status_code::resource_exhausted;
     if (core->next_id > wire::max_stream_id) {
@@ -171,16 +149,23 @@ status_code call_access::start(unary_call &call) noexcept {
         return status_code::unavailable;
     }
 
-    auto deadline = clock::time_point::max();
+    // The first attempt fixes the absolute deadline; later ones only read the clock.
     std::uint64_t timeout_us = 0;
-    if (auto const *spec = call.spec_) {
-        if (spec->deadline != clock::time_point::max() || spec->timeout.count() > 0) {
+    if (call.deadline_ == clock::time_point::min()) {
+        call.deadline_ = clock::time_point::max();
+        auto const *spec = call.spec_;
+        if (spec != nullptr && (spec->deadline != clock::time_point::max() || spec->timeout.count() > 0)) {
             auto const current = now();
-            deadline = spec->deadline;
-            if (spec->timeout.count() > 0 && spec->timeout < deadline - current) deadline = current + spec->timeout;
-            if (deadline <= current) return status_code::deadline_exceeded;
-            timeout_us = remaining_us(deadline - current);
+            call.deadline_ = spec->deadline;
+            if (spec->timeout.count() > 0 && spec->timeout < call.deadline_ - current)
+                call.deadline_ = current + spec->timeout;
+            if (call.deadline_ <= current) return status_code::deadline_exceeded;
+            timeout_us = remaining_us(call.deadline_ - current);
         }
+    } else if (call.deadline_ != clock::time_point::max()) {
+        auto const current = now();
+        if (call.deadline_ <= current) return status_code::deadline_exceeded;
+        timeout_us = remaining_us(call.deadline_ - current);
     }
 
     auto &slot = core->methods[call.method_ - 1];
@@ -194,10 +179,11 @@ status_code call_access::start(unary_call &call) noexcept {
     auto const payload = head_size.written + call.request_.size;
     if (payload > peer.max_frame_size) return status_code::resource_exhausted;
 
+    // A retried call keeps the hook of its first attempt.
     stop_hook *hook = nullptr;
     std::uint8_t *frame = nullptr;
     try {
-        if (env.stop_token.stop_possible()) hook = core->shard.acquire_hook();
+        if (call.hook_ == nullptr && env.stop_token.stop_possible()) hook = core->shard.acquire_hook();
         frame = conn.reserve(wire::header_size + payload);
     } catch (std::bad_alloc const &) {
         if (hook != nullptr) core->shard.release_hook(*hook);
@@ -224,11 +210,13 @@ status_code call_access::start(unary_call &call) noexcept {
     call.id = id;
     call.ops = &unary_ops;
     core->streams.insert(call);
-    if (deadline != clock::time_point::max()) core->shard.schedule(call, deadline);
+    if (call.deadline_ != clock::time_point::max()) core->shard.schedule(call, call.deadline_);
     call.phase_ = call_pending;
-    call.hook_ = hook;
     conn.commit(wire::header_size + payload);
-    if (hook != nullptr) hook->attach(call, env.stop_token); // Last: the request may already be pending.
+    if (hook != nullptr) {
+        call.hook_ = hook;
+        hook->attach(call, env.stop_token); // Last: the request may already be pending.
+    }
     return status_code::ok;
 }
 
@@ -252,9 +240,9 @@ bool client_core::on_frame(wire::frame_view const &frame) noexcept {
         } catch (std::bad_alloc const &) {
             return false;
         }
-        // The server will not run streams above aux; they may be retried elsewhere.
+        // The server will not run streams above aux.
         for (auto *stream : unstarted)
-            if (stream->id > header.aux) stream->ops->on_abort(*stream, status_code::unavailable);
+            if (stream->id > header.aux) stream->ops->on_abort(*stream, status_code::unavailable, true);
         settle();
         return true;
     }
@@ -280,8 +268,9 @@ void client_core::on_closed() noexcept {
         connect_status = conn->handshake_expired() ? status_code::deadline_exceeded : status_code::unavailable;
         ready_event.signal();
     }
-    while (auto *stream = streams.any()) stream->ops->on_abort(*stream, status_code::unavailable);
+    while (auto *stream = streams.any()) stream->ops->on_abort(*stream, status_code::unavailable, false);
     end_endpoint();
+    closed_event.signal();
 }
 
 namespace {
@@ -326,24 +315,41 @@ auto connect_task(std::shared_ptr<client_core> core, net::ip::tcp::endpoint endp
 CO2_END
 
 } // namespace
+
+net::task<status_code> connect_client(std::shared_ptr<client_core> core, net::ip::tcp::endpoint endpoint) {
+    return connect_task(std::move(core), endpoint);
+}
+
+net::task<status_code> attach_client(std::shared_ptr<client_core> core, std::unique_ptr<transport> link) {
+    return attach_task(std::move(core), std::move(link));
+}
+
 } // namespace detail
 
-unary_call::unary_call(detail::client_core *core, std::uint32_t method, wire::bytes_view request,
-                       wire::mutable_bytes_view response, call_spec const *spec, response_trailer *trailer) noexcept
-    : core_(core), request_(request), response_(response), spec_(spec), trailer_(trailer), method_(method) {}
+unary_call::unary_call(detail::client_core *core, detail::call_router *router, std::uint32_t method,
+                       wire::bytes_view request, wire::mutable_bytes_view response, call_spec const *spec,
+                       response_trailer *trailer) noexcept
+    : core_(core), router_(router), request_(request), response_(response), spec_(spec), trailer_(trailer),
+      method_(method) {}
 
 unary_call::unary_call(unary_call &&other) noexcept
-    : detail::stream_state(), core_(other.core_), request_(other.request_), response_(other.response_),
-      spec_(other.spec_), trailer_(other.trailer_), method_(other.method_) {
+    : detail::stream_state(), core_(other.core_), router_(other.router_), request_(other.request_),
+      response_(other.response_), spec_(other.spec_), trailer_(other.trailer_), method_(other.method_) {
     assert(other.phase_ == detail::call_idle);
 }
 
 net::coroutine_handle<> unary_call::await_suspend(net::coroutine_handle<> handle, net::io_env const *env) noexcept {
     continuation_.h = handle;
     env_ = env;
-    auto const code = detail::call_access::start(*this);
+    if (auto *const trailer = trailer_) {
+        trailer->message = {};
+        trailer->metadata = {};
+        trailer->truncated = false;
+    }
+    auto const code = detail::call_access::launch(*this, nullptr);
     if (code == status_code::ok) return net::noop_coroutine();
     code_ = code;
+    not_executed_ = true;
     phase_ = detail::call_done;
     return handle;
 }
@@ -353,7 +359,7 @@ call_result unary_call::await_resume() noexcept {
         hook_->detach();
         hook_ = nullptr;
     }
-    return call_result{code_, size_};
+    return call_result{code_, size_, not_executed_};
 }
 
 client::client(shard &owner, client_options options)
@@ -362,11 +368,11 @@ client::client(shard &owner, client_options options)
 client::~client() { close(); }
 
 net::task<status_code> client::connect(net::ip::tcp::endpoint endpoint) {
-    return detail::connect_task(core_, endpoint);
+    return detail::connect_client(core_, endpoint);
 }
 
 net::task<status_code> client::attach(std::unique_ptr<transport> link) {
-    return detail::attach_task(core_, std::move(link));
+    return detail::attach_client(core_, std::move(link));
 }
 
 method_ref client::bind(std::string const &name) {

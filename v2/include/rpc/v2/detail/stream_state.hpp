@@ -23,7 +23,9 @@ struct stream_state;
 // Each callback runs on the shard's thread and must unregister the stream.
 struct stream_ops {
     void (*on_frame)(stream_state &, wire::frame_view const &) noexcept;
-    void (*on_abort)(stream_state &, status_code) noexcept; // Connection closed.
+    // Connection closed or going away; not_executed when the peer proved it
+    // never started the stream.
+    void (*on_abort)(stream_state &, status_code, bool not_executed) noexcept;
     void (*on_deadline)(stream_state &) noexcept;
     void (*on_cancel)(stream_state &) noexcept; // Local stop request.
 };
