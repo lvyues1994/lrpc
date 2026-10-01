@@ -49,7 +49,19 @@ struct S {
 };
 void invoke(S &s) { example::users_bindings(example::users_contract(rpc::json_codec_policy{}), s); }
 ]=])
-foreach(name positive wrong_request wrong_response wrong_handler forged_method unmapped wrong_service_call wrong_service_handler)
+set(unnamed_enum [=[
+enum class Mood { calm };
+struct WithMood { Mood mood = Mood::calm; };
+RPC_JSON_FIELDS(WithMood, mood);
+bool invoke(WithMood &m) { return rpc::json_codec<WithMood>::decode({}, m); }
+]=])
+set(integer_keys [=[
+struct WithMap { std::map<int, int> values; };
+RPC_JSON_FIELDS(WithMap, values);
+std::size_t invoke(WithMap const &m) { return rpc::json_codec<WithMap>::upper_bound(m); }
+]=])
+foreach(name positive wrong_request wrong_response wrong_handler forged_method unmapped wrong_service_call wrong_service_handler
+        unnamed_enum integer_keys)
     file(WRITE "${WORK}/${name}.cpp" "${prelude}${${name}}")
     execute_process(COMMAND "${COMPILER}" -std=c++14 -fsyntax-only ${flags} "${WORK}/${name}.cpp"
         RESULT_VARIABLE result OUTPUT_VARIABLE output ERROR_VARIABLE error)
@@ -61,4 +73,4 @@ foreach(name positive wrong_request wrong_response wrong_handler forged_method u
         message(FATAL_ERROR "Invalid typed contract compiled: ${name}")
     endif()
 endforeach()
-message(STATUS "Typed method/service stub positive and seven negative compile checks passed")
+message(STATUS "Typed method/service stub positive and nine negative compile checks passed")

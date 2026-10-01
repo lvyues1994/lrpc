@@ -57,6 +57,8 @@ if(LRPC_BUILD_TESTS)
 
     if(LRPC_BUILD_JSON)
         lrpc_test(json TIMEOUT 20 LIBRARIES lrpc::json)
+        lrpc_test(json17 TIMEOUT 20 LIBRARIES lrpc::json)
+        set_target_properties(json17_tests PROPERTIES CXX_STANDARD 17)
         lrpc_test(json_rpc TIMEOUT 20 LIBRARIES lrpc::json)
         lrpc_compile_test(json_compile json_compile_tests.cmake json_tests)
     endif()

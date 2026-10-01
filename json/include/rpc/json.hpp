@@ -4,10 +4,21 @@
 #include <cmath>
 #include <cstdint>
 #include <limits>
+#include <map>
+#include <memory>
 #include <vector>
 #include <cstring>
+#include <string>
 #include <tuple>
 #include <type_traits>
+#include <unordered_map>
+#include <utility>
+#if defined(__has_include)
+#if __has_include(<optional>) && __cplusplus >= 201703L
+#include <optional>
+#define RPC_JSON_OPTIONAL 1
+#endif
+#endif
 
 namespace rpc {
 
@@ -37,6 +48,21 @@ template <class Owner, class Member>
 json_field_descriptor<Owner, Member> json_field(char const *name, Member Owner::*member, bool required = false) {
     if (!name || !member) throw std::invalid_argument{"invalid JSON field"};
     return {name, member, required, std::strlen(name)};
+}
+
+// An enum travels as the name of its value. Specializations provide
+//   static <container of json_enumerator_descriptor<Enum>> values();
+// Names must be unique; a value with several names writes the first.
+template <class Enum> struct json_enum_traits;
+template <class Enum> struct json_enumerator_descriptor {
+    char const *name;
+    Enum value;
+    std::size_t name_size;
+};
+template <class Enum> json_enumerator_descriptor<Enum> json_enumerator(char const *name, Enum value) {
+    static_assert(std::is_enum<Enum>::value, "JSON enumerators name the values of an enum");
+    if (!name) throw std::invalid_argument{"invalid JSON enumerator"};
+    return {name, value, std::strlen(name)};
 }
 
 namespace json_detail {
@@ -97,7 +123,10 @@ struct node_ops {
     node (*field)(void *, char const *, std::size_t, std::size_t &);
     node (*element)(read_context &, void *);
     std::uint64_t (*required)();
-    void (*reset)(void *);
+    void (*reset)(read_context &, void *);
+    // Objects with arbitrary keys (maps): the slot for a new key, or nothing
+    // for a repeated one. Null for every other kind of node.
+    node (*entry)(read_context &, void *, char const *, std::size_t);
 };
 using write_function = bool (*)(write_context &, void const *);
 wire::encode_result write_message(void const *, write_function, wire::mutable_bytes_view, json_limits, bool count = false);
@@ -113,7 +142,7 @@ inline std::size_t string_bound(std::size_t size) noexcept {
 }
 
 template <class T, class = void> struct value_codec {
-    static_assert(sizeof(T) == 0, "JSON field needs a supported value type or json_traits<T>");
+    static_assert(sizeof(T) == 0, "JSON field needs a supported value type, json_traits<T> or json_enum_traits<T>");
 };
 template <class T> node_ops const &operations();
 template <class T> node make_node(T &value) { return {&value, &operations<T>()}; }
@@ -130,7 +159,7 @@ template <class T> struct value_codec<T, typename std::enable_if<std::is_integra
         out = static_cast<T>(value.unsigned_integer); return true;
     }
     static bool write(write_context &context, T value) { atom a; a.kind = atom_kind::signed_integer; a.signed_integer = value; return context.sink.value(a); }
-    static void reset(T &value) noexcept { value = T{}; }
+    static void reset(read_context &, T &value) noexcept { value = T{}; }
     static std::size_t bound(T, json_limits const &, std::size_t) noexcept { return 21; }
 };
 template <class T> struct value_codec<T, typename std::enable_if<std::is_integral<T>::value &&
@@ -145,7 +174,7 @@ template <class T> struct value_codec<T, typename std::enable_if<std::is_integra
         out = static_cast<T>(value.unsigned_integer); return true;
     }
     static bool write(write_context &context, T value) { atom a; a.kind = atom_kind::unsigned_integer; a.unsigned_integer = value; return context.sink.value(a); }
-    static void reset(T &value) noexcept { value = T{}; }
+    static void reset(read_context &, T &value) noexcept { value = T{}; }
     static std::size_t bound(T, json_limits const &, std::size_t) noexcept { return 20; }
 };
 template <> struct value_codec<bool> {
@@ -155,7 +184,7 @@ template <> struct value_codec<bool> {
         out = value.boolean; return true;
     }
     static bool write(write_context &context, bool value) { atom a; a.kind = atom_kind::boolean; a.boolean = value; return context.sink.value(a); }
-    static void reset(bool &value) noexcept { value = false; }
+    static void reset(read_context &, bool &value) noexcept { value = false; }
     static std::size_t bound(bool, json_limits const &, std::size_t) noexcept { return 5; }
 };
 template <class T> struct value_codec<T, typename std::enable_if<std::is_floating_point<T>::value>::type> {
@@ -174,7 +203,7 @@ template <class T> struct value_codec<T, typename std::enable_if<std::is_floatin
         if (!std::isfinite(value)) return false;
         atom a; a.kind = atom_kind::number; a.number = value; return context.sink.value(a);
     }
-    static void reset(T &value) noexcept { value = T{}; }
+    static void reset(read_context &, T &value) noexcept { value = T{}; }
     static std::size_t bound(T, json_limits const &, std::size_t) noexcept { return 32; }
 };
 template <> struct value_codec<std::string> {
@@ -187,11 +216,115 @@ template <> struct value_codec<std::string> {
         if (value.size() > context.limits.max_string_bytes) return false;
         atom a; a.kind = atom_kind::string; a.text = value.c_str(); a.size = value.size(); return context.sink.value(a);
     }
-    static void reset(std::string &value) noexcept { value.clear(); }
+    static void reset(read_context &, std::string &value) noexcept { value.clear(); }
     static std::size_t bound(std::string const &value, json_limits const &limits, std::size_t) {
         if (value.size() > limits.max_string_bytes) throw std::invalid_argument{"JSON string limit"};
         return string_bound(value.size());
     }
+};
+
+template <class T, class = void> struct named_enum : std::false_type {};
+template <class T> struct named_enum<T, void_t<decltype(json_enum_traits<T>::values())>> : std::true_type {};
+// Validated on first use, like nested mappings.
+template <class E> std::vector<json_enumerator_descriptor<E>> const &enumerators() {
+    static auto const table = [] {
+        std::vector<json_enumerator_descriptor<E>> result;
+        for (auto const &e : json_enum_traits<E>::values()) {
+            if (!e.name || e.name_size != std::strlen(e.name)) throw std::invalid_argument{"invalid JSON enumerator"};
+            for (auto const &seen : result)
+                if (seen.name_size == e.name_size && std::memcmp(seen.name, e.name, e.name_size) == 0)
+                    throw std::invalid_argument{"duplicate JSON enumerator"};
+            result.push_back(e);
+        }
+        return result;
+    }();
+    return table;
+}
+template <class E> struct value_codec<E, typename std::enable_if<named_enum<E>::value>::type> {
+    static constexpr node_kind kind = node_kind::scalar;
+    static json_enumerator_descriptor<E> const *find(E value) {
+        for (auto const &e : enumerators<E>()) if (e.value == value) return &e;
+        return nullptr;
+    }
+    static bool read(read_context &, E &out, atom const &value) {
+        if (value.kind != atom_kind::string) return false;
+        for (auto const &e : enumerators<E>())
+            if (e.name_size == value.size && std::memcmp(e.name, value.text, value.size) == 0) { out = e.value; return true; }
+        return false;
+    }
+    static bool write(write_context &context, E value) {
+        auto const *e = find(value);
+        if (!e || e->name_size > context.limits.max_string_bytes) return false;
+        atom a; a.kind = atom_kind::string; a.text = e->name; a.size = e->name_size; return context.sink.value(a);
+    }
+    static void reset(read_context &, E &value) noexcept { value = E{}; }
+    static std::size_t bound(E value, json_limits const &, std::size_t) {
+        auto const *e = find(value);
+        if (!e) throw std::invalid_argument{"JSON enum value without a name"};
+        return string_bound(e->name_size);
+    }
+};
+
+// Values that may be absent: null or a missing field reads as empty, and an
+// empty field is left out of its object (null inside arrays and maps).
+template <class T> struct nullable_traits {};
+template <class T> struct nullable_traits<std::unique_ptr<T>> {
+    using value_type = T;
+    static bool engaged(std::unique_ptr<T> const &value) noexcept { return value != nullptr; }
+    static T const &get(std::unique_ptr<T> const &value) noexcept { return *value; }
+    static T &get(std::unique_ptr<T> &value) noexcept { return *value; }
+    static T &engage(read_context &context, std::unique_ptr<T> &value) {
+        if (!value) {
+            context.charge(sizeof(T));
+            value.reset(new T{});
+        }
+        return *value;
+    }
+    static void clear(std::unique_ptr<T> &value) noexcept { value.reset(); }
+};
+#if defined(RPC_JSON_OPTIONAL)
+template <class T> struct nullable_traits<std::optional<T>> {
+    using value_type = T;
+    static bool engaged(std::optional<T> const &value) noexcept { return value.has_value(); }
+    static T const &get(std::optional<T> const &value) noexcept { return *value; }
+    static T &get(std::optional<T> &value) noexcept { return *value; }
+    static T &engage(read_context &, std::optional<T> &value) {
+        if (!value) value.emplace();
+        return *value;
+    }
+    static void clear(std::optional<T> &value) noexcept { value.reset(); }
+};
+#endif
+template <class T, class = void> struct nullable : std::false_type {};
+template <class T> struct nullable<T, void_t<typename nullable_traits<T>::value_type>> : std::true_type {};
+
+template <class N> struct value_codec<N, typename std::enable_if<nullable<N>::value>::type> {
+    using traits = nullable_traits<N>;
+    using inner = value_codec<typename traits::value_type>;
+    static constexpr node_kind kind = inner::kind;
+    static bool read(read_context &context, N &out, atom const &value) {
+        if (value.kind == atom_kind::null) {
+            traits::clear(out);
+            return true;
+        }
+        return inner::read(context, traits::engage(context, out), value);
+    }
+    static bool write(write_context &context, N const &value) {
+        if (!traits::engaged(value)) return context.sink.value(atom{});
+        return inner::write(context, traits::get(value));
+    }
+    // An object or array is arriving: it fills a fresh value.
+    static void reset(read_context &context, N &value) { inner::reset(context, traits::engage(context, value)); }
+    static std::size_t bound(N const &value, json_limits const &limits, std::size_t depth) {
+        return traits::engaged(value) ? inner::bound(traits::get(value), limits, depth) : 4;
+    }
+};
+
+template <class T, class = void> struct presence {
+    static bool present(T const &) noexcept { return true; }
+};
+template <class N> struct presence<N, typename std::enable_if<nullable<N>::value>::type> {
+    static bool present(N const &value) noexcept { return nullable_traits<N>::engaged(value); }
 };
 
 template <class Tuple, class Function, std::size_t... I>
@@ -236,7 +369,7 @@ template <class T> struct value_codec<T, typename std::enable_if<mapped<T>::valu
             }, indices{});
         }, indices{});
     }
-    static void reset(T &value) {
+    static void reset(read_context &, T &value) {
         value = T{};
     }
     static bool write(write_context &context, T const &value) {
@@ -246,7 +379,8 @@ template <class T> struct value_codec<T, typename std::enable_if<mapped<T>::valu
         bool okay = true;
         each(fields<T>(), [&](auto const &f, std::size_t) {
             using member_type = typename std::decay<decltype(value.*f.member)>::type;
-            okay = okay && f.name_size <= context.limits.max_string_bytes && context.sink.key(f.name, f.name_size) &&
+            if (!okay || !presence<member_type>::present(value.*f.member)) return;
+            okay = f.name_size <= context.limits.max_string_bytes && context.sink.key(f.name, f.name_size) &&
                 value_codec<member_type>::write(context, value.*f.member);
         }, indices{});
         return okay && context.sink.end_object();
@@ -257,6 +391,7 @@ template <class T> struct value_codec<T, typename std::enable_if<mapped<T>::valu
         std::size_t size = 2;
         each(fields<T>(), [&](auto const &f, std::size_t) {
             using member_type = typename std::decay<decltype(value.*f.member)>::type;
+            if (!presence<member_type>::present(value.*f.member)) return;
             if (f.name_size > limits.max_string_bytes) throw std::invalid_argument{"JSON key limit"};
             size = add_bound(size, add_bound(string_bound(f.name_size), add_bound(2, value_codec<member_type>::bound(value.*f.member, limits, depth + 1))));
         }, indices{});
@@ -272,7 +407,7 @@ template <class T, class Allocator> struct value_codec<std::vector<T, Allocator>
         if (value.size() >= context.limits.max_array_elements) return {};
         context.charge(sizeof(T)); value.emplace_back(); return make_node(value.back());
     }
-    static void reset(vector_type &value) { value.clear(); }
+    static void reset(read_context &, vector_type &value) { value.clear(); }
     static bool write(write_context &context, vector_type const &value) {
         depth_guard guard{context};
         if (!guard.valid() || value.size() > context.limits.max_array_elements || !context.sink.start_array()) return false;
@@ -287,27 +422,95 @@ template <class T, class Allocator> struct value_codec<std::vector<T, Allocator>
     }
 };
 
+// An object with arbitrary keys; entries count against max_object_fields.
+template <class T> struct string_map : std::false_type {};
+template <class T, class Compare, class Allocator>
+struct string_map<std::map<std::string, T, Compare, Allocator>> : std::true_type {};
+template <class T, class Hash, class Equal, class Allocator>
+struct string_map<std::unordered_map<std::string, T, Hash, Equal, Allocator>> : std::true_type {};
+template <class M> struct value_codec<M, typename std::enable_if<string_map<M>::value>::type> {
+    using mapped_type = typename M::mapped_type;
+    static constexpr node_kind kind = node_kind::object;
+    static bool read(read_context &, M &, atom const &) { return false; }
+    static node entry(read_context &context, M &value, char const *name, std::size_t size) {
+        context.charge(add_bound(size, sizeof(typename M::value_type)));
+        auto const inserted = value.emplace(std::piecewise_construct, std::forward_as_tuple(name, size), std::forward_as_tuple());
+        return inserted.second ? make_node(inserted.first->second) : node{};
+    }
+    static void reset(read_context &, M &value) { value.clear(); }
+    static bool write(write_context &context, M const &value) {
+        depth_guard guard{context};
+        if (!guard.valid() || value.size() > context.limits.max_object_fields || !context.sink.start_object()) return false;
+        for (auto const &item : value)
+            if (item.first.size() > context.limits.max_string_bytes || !context.sink.key(item.first.data(), item.first.size()) ||
+                !value_codec<mapped_type>::write(context, item.second)) return false;
+        return context.sink.end_object();
+    }
+    static std::size_t bound(M const &value, json_limits const &limits, std::size_t depth) {
+        if (depth >= limits.max_depth || value.size() > limits.max_object_fields) throw std::invalid_argument{"JSON object limit"};
+        std::size_t size = 2;
+        for (auto const &item : value) {
+            if (item.first.size() > limits.max_string_bytes) throw std::invalid_argument{"JSON key limit"};
+            size = add_bound(size, add_bound(string_bound(item.first.size()),
+                                             add_bound(2, value_codec<mapped_type>::bound(item.second, limits, depth + 1))));
+        }
+        return size;
+    }
+};
+
 template <class T, class = void> struct container_access {
+    static constexpr bool keyed = false;
     static node field(void *, char const *, std::size_t, std::size_t &) { return {}; }
     static node element(read_context &, void *) { return {}; }
+    static node entry(read_context &, void *, char const *, std::size_t) { return {}; }
     static std::uint64_t required() { return 0; }
     static void validate() {}
 };
 template <class T> struct container_access<T, typename std::enable_if<mapped<T>::value>::type> {
+    static constexpr bool keyed = false;
     static node field(void *target, char const *name, std::size_t size, std::size_t &index) {
         return value_codec<T>::field(*static_cast<T *>(target), name, size, index);
     }
     static node element(read_context &, void *) { return {}; }
+    static node entry(read_context &, void *, char const *, std::size_t) { return {}; }
     static std::uint64_t required() { return value_codec<T>::required(); }
     static void validate() { value_codec<T>::validate(); }
 };
 template <class T, class Allocator> struct container_access<std::vector<T, Allocator>> {
+    static constexpr bool keyed = false;
     static node field(void *, char const *, std::size_t, std::size_t &) { return {}; }
     static node element(read_context &context, void *target) {
         return value_codec<std::vector<T, Allocator>>::element(context, *static_cast<std::vector<T, Allocator> *>(target));
     }
+    static node entry(read_context &, void *, char const *, std::size_t) { return {}; }
     static std::uint64_t required() { return 0; }
     static void validate() {}
+};
+template <class M> struct container_access<M, typename std::enable_if<string_map<M>::value>::type> {
+    static constexpr bool keyed = true;
+    static node field(void *, char const *, std::size_t, std::size_t &) { return {}; }
+    static node element(read_context &, void *) { return {}; }
+    static node entry(read_context &context, void *target, char const *name, std::size_t size) {
+        return value_codec<M>::entry(context, *static_cast<M *>(target), name, size);
+    }
+    static std::uint64_t required() { return 0; }
+    static void validate() {}
+};
+// An object or array reaches a nullable only after reset has engaged it.
+template <class N> struct container_access<N, typename std::enable_if<nullable<N>::value>::type> {
+    using traits = nullable_traits<N>;
+    using inner = container_access<typename traits::value_type>;
+    static constexpr bool keyed = inner::keyed;
+    static void *held(void *target) noexcept { return &traits::get(*static_cast<N *>(target)); }
+    static node field(void *target, char const *name, std::size_t size, std::size_t &index) {
+        return inner::field(held(target), name, size, index);
+    }
+    static node element(read_context &context, void *target) { return inner::element(context, held(target)); }
+    static node entry(read_context &context, void *target, char const *name, std::size_t size) {
+        return inner::entry(context, held(target), name, size);
+    }
+    static std::uint64_t required() { return inner::required(); }
+    static void validate() { inner::validate(); }
 };
 template <class T> node_ops const &operations() {
     static node_ops const value = [] {
@@ -315,7 +518,8 @@ template <class T> node_ops const &operations() {
         return node_ops{value_codec<T>::kind,
             [](read_context &context, void *target, atom const &a) { return value_codec<T>::read(context, *static_cast<T *>(target), a); },
             &container_access<T>::field, &container_access<T>::element, &container_access<T>::required,
-            [](void *target) { value_codec<T>::reset(*static_cast<T *>(target)); }};
+            [](read_context &context, void *target) { value_codec<T>::reset(context, *static_cast<T *>(target)); },
+            container_access<T>::keyed ? &container_access<T>::entry : nullptr};
     }();
     return value;
 }
@@ -371,31 +575,87 @@ template <class Request, class Response> using json_bound_method = bound_method<
 
 } // namespace rpc
 
-// Convenience mapping, used at namespace scope outside namespace rpc.
+// Convenience mappings, used at namespace scope outside namespace rpc.
 #define RPC_DETAIL_JSON_FIELD(Type, Field) ::rpc::json_field(#Field, &Type::Field)
+#define RPC_DETAIL_JSON_ENUMERATOR(Type, Value) ::rpc::json_enumerator(#Value, Type::Value)
 #define RPC_DETAIL_JSON_JOIN_IMPL(A, B) A##B
 #define RPC_DETAIL_JSON_JOIN(A, B) RPC_DETAIL_JSON_JOIN_IMPL(A, B)
-#define RPC_DETAIL_JSON_COUNT_IMPL(_1,_2,_3,_4,_5,_6,_7,_8,_9,_10,_11,_12,_13,_14,_15,_16,N,...) N
-#define RPC_DETAIL_JSON_COUNT(...) RPC_DETAIL_JSON_COUNT_IMPL(__VA_ARGS__,16,15,14,13,12,11,10,9,8,7,6,5,4,3,2,1,0)
-#define RPC_DETAIL_JSON_FIELDS_1(T,A) RPC_DETAIL_JSON_FIELD(T,A)
-#define RPC_DETAIL_JSON_FIELDS_2(T,A,...) RPC_DETAIL_JSON_FIELD(T,A), RPC_DETAIL_JSON_FIELDS_1(T,__VA_ARGS__)
-#define RPC_DETAIL_JSON_FIELDS_3(T,A,...) RPC_DETAIL_JSON_FIELD(T,A), RPC_DETAIL_JSON_FIELDS_2(T,__VA_ARGS__)
-#define RPC_DETAIL_JSON_FIELDS_4(T,A,...) RPC_DETAIL_JSON_FIELD(T,A), RPC_DETAIL_JSON_FIELDS_3(T,__VA_ARGS__)
-#define RPC_DETAIL_JSON_FIELDS_5(T,A,...) RPC_DETAIL_JSON_FIELD(T,A), RPC_DETAIL_JSON_FIELDS_4(T,__VA_ARGS__)
-#define RPC_DETAIL_JSON_FIELDS_6(T,A,...) RPC_DETAIL_JSON_FIELD(T,A), RPC_DETAIL_JSON_FIELDS_5(T,__VA_ARGS__)
-#define RPC_DETAIL_JSON_FIELDS_7(T,A,...) RPC_DETAIL_JSON_FIELD(T,A), RPC_DETAIL_JSON_FIELDS_6(T,__VA_ARGS__)
-#define RPC_DETAIL_JSON_FIELDS_8(T,A,...) RPC_DETAIL_JSON_FIELD(T,A), RPC_DETAIL_JSON_FIELDS_7(T,__VA_ARGS__)
-#define RPC_DETAIL_JSON_FIELDS_9(T,A,...) RPC_DETAIL_JSON_FIELD(T,A), RPC_DETAIL_JSON_FIELDS_8(T,__VA_ARGS__)
-#define RPC_DETAIL_JSON_FIELDS_10(T,A,...) RPC_DETAIL_JSON_FIELD(T,A), RPC_DETAIL_JSON_FIELDS_9(T,__VA_ARGS__)
-#define RPC_DETAIL_JSON_FIELDS_11(T,A,...) RPC_DETAIL_JSON_FIELD(T,A), RPC_DETAIL_JSON_FIELDS_10(T,__VA_ARGS__)
-#define RPC_DETAIL_JSON_FIELDS_12(T,A,...) RPC_DETAIL_JSON_FIELD(T,A), RPC_DETAIL_JSON_FIELDS_11(T,__VA_ARGS__)
-#define RPC_DETAIL_JSON_FIELDS_13(T,A,...) RPC_DETAIL_JSON_FIELD(T,A), RPC_DETAIL_JSON_FIELDS_12(T,__VA_ARGS__)
-#define RPC_DETAIL_JSON_FIELDS_14(T,A,...) RPC_DETAIL_JSON_FIELD(T,A), RPC_DETAIL_JSON_FIELDS_13(T,__VA_ARGS__)
-#define RPC_DETAIL_JSON_FIELDS_15(T,A,...) RPC_DETAIL_JSON_FIELD(T,A), RPC_DETAIL_JSON_FIELDS_14(T,__VA_ARGS__)
-#define RPC_DETAIL_JSON_FIELDS_16(T,A,...) RPC_DETAIL_JSON_FIELD(T,A), RPC_DETAIL_JSON_FIELDS_15(T,__VA_ARGS__)
+#define RPC_DETAIL_JSON_COUNT_IMPL(_1,_2,_3,_4,_5,_6,_7,_8,_9,_10,_11,_12,_13,_14,_15,_16,_17,_18,_19,_20,_21,_22,_23,_24,_25,_26,_27,_28,_29,_30,_31,_32,_33,_34,_35,_36,_37,_38,_39,_40,_41,_42,_43,_44,_45,_46,_47,_48,_49,_50,_51,_52,_53,_54,_55,_56,_57,_58,_59,_60,_61,_62,_63,_64,N,...) N
+#define RPC_DETAIL_JSON_COUNT(...) RPC_DETAIL_JSON_COUNT_IMPL(__VA_ARGS__,64,63,62,61,60,59,58,57,56,55,54,53,52,51,50,49,48,47,46,45,44,43,42,41,40,39,38,37,36,35,34,33,32,31,30,29,28,27,26,25,24,23,22,21,20,19,18,17,16,15,14,13,12,11,10,9,8,7,6,5,4,3,2,1,0)
+#define RPC_DETAIL_JSON_EACH_1(M,T,A) M(T,A)
+#define RPC_DETAIL_JSON_EACH_2(M,T,A,...) M(T,A), RPC_DETAIL_JSON_EACH_1(M,T,__VA_ARGS__)
+#define RPC_DETAIL_JSON_EACH_3(M,T,A,...) M(T,A), RPC_DETAIL_JSON_EACH_2(M,T,__VA_ARGS__)
+#define RPC_DETAIL_JSON_EACH_4(M,T,A,...) M(T,A), RPC_DETAIL_JSON_EACH_3(M,T,__VA_ARGS__)
+#define RPC_DETAIL_JSON_EACH_5(M,T,A,...) M(T,A), RPC_DETAIL_JSON_EACH_4(M,T,__VA_ARGS__)
+#define RPC_DETAIL_JSON_EACH_6(M,T,A,...) M(T,A), RPC_DETAIL_JSON_EACH_5(M,T,__VA_ARGS__)
+#define RPC_DETAIL_JSON_EACH_7(M,T,A,...) M(T,A), RPC_DETAIL_JSON_EACH_6(M,T,__VA_ARGS__)
+#define RPC_DETAIL_JSON_EACH_8(M,T,A,...) M(T,A), RPC_DETAIL_JSON_EACH_7(M,T,__VA_ARGS__)
+#define RPC_DETAIL_JSON_EACH_9(M,T,A,...) M(T,A), RPC_DETAIL_JSON_EACH_8(M,T,__VA_ARGS__)
+#define RPC_DETAIL_JSON_EACH_10(M,T,A,...) M(T,A), RPC_DETAIL_JSON_EACH_9(M,T,__VA_ARGS__)
+#define RPC_DETAIL_JSON_EACH_11(M,T,A,...) M(T,A), RPC_DETAIL_JSON_EACH_10(M,T,__VA_ARGS__)
+#define RPC_DETAIL_JSON_EACH_12(M,T,A,...) M(T,A), RPC_DETAIL_JSON_EACH_11(M,T,__VA_ARGS__)
+#define RPC_DETAIL_JSON_EACH_13(M,T,A,...) M(T,A), RPC_DETAIL_JSON_EACH_12(M,T,__VA_ARGS__)
+#define RPC_DETAIL_JSON_EACH_14(M,T,A,...) M(T,A), RPC_DETAIL_JSON_EACH_13(M,T,__VA_ARGS__)
+#define RPC_DETAIL_JSON_EACH_15(M,T,A,...) M(T,A), RPC_DETAIL_JSON_EACH_14(M,T,__VA_ARGS__)
+#define RPC_DETAIL_JSON_EACH_16(M,T,A,...) M(T,A), RPC_DETAIL_JSON_EACH_15(M,T,__VA_ARGS__)
+#define RPC_DETAIL_JSON_EACH_17(M,T,A,...) M(T,A), RPC_DETAIL_JSON_EACH_16(M,T,__VA_ARGS__)
+#define RPC_DETAIL_JSON_EACH_18(M,T,A,...) M(T,A), RPC_DETAIL_JSON_EACH_17(M,T,__VA_ARGS__)
+#define RPC_DETAIL_JSON_EACH_19(M,T,A,...) M(T,A), RPC_DETAIL_JSON_EACH_18(M,T,__VA_ARGS__)
+#define RPC_DETAIL_JSON_EACH_20(M,T,A,...) M(T,A), RPC_DETAIL_JSON_EACH_19(M,T,__VA_ARGS__)
+#define RPC_DETAIL_JSON_EACH_21(M,T,A,...) M(T,A), RPC_DETAIL_JSON_EACH_20(M,T,__VA_ARGS__)
+#define RPC_DETAIL_JSON_EACH_22(M,T,A,...) M(T,A), RPC_DETAIL_JSON_EACH_21(M,T,__VA_ARGS__)
+#define RPC_DETAIL_JSON_EACH_23(M,T,A,...) M(T,A), RPC_DETAIL_JSON_EACH_22(M,T,__VA_ARGS__)
+#define RPC_DETAIL_JSON_EACH_24(M,T,A,...) M(T,A), RPC_DETAIL_JSON_EACH_23(M,T,__VA_ARGS__)
+#define RPC_DETAIL_JSON_EACH_25(M,T,A,...) M(T,A), RPC_DETAIL_JSON_EACH_24(M,T,__VA_ARGS__)
+#define RPC_DETAIL_JSON_EACH_26(M,T,A,...) M(T,A), RPC_DETAIL_JSON_EACH_25(M,T,__VA_ARGS__)
+#define RPC_DETAIL_JSON_EACH_27(M,T,A,...) M(T,A), RPC_DETAIL_JSON_EACH_26(M,T,__VA_ARGS__)
+#define RPC_DETAIL_JSON_EACH_28(M,T,A,...) M(T,A), RPC_DETAIL_JSON_EACH_27(M,T,__VA_ARGS__)
+#define RPC_DETAIL_JSON_EACH_29(M,T,A,...) M(T,A), RPC_DETAIL_JSON_EACH_28(M,T,__VA_ARGS__)
+#define RPC_DETAIL_JSON_EACH_30(M,T,A,...) M(T,A), RPC_DETAIL_JSON_EACH_29(M,T,__VA_ARGS__)
+#define RPC_DETAIL_JSON_EACH_31(M,T,A,...) M(T,A), RPC_DETAIL_JSON_EACH_30(M,T,__VA_ARGS__)
+#define RPC_DETAIL_JSON_EACH_32(M,T,A,...) M(T,A), RPC_DETAIL_JSON_EACH_31(M,T,__VA_ARGS__)
+#define RPC_DETAIL_JSON_EACH_33(M,T,A,...) M(T,A), RPC_DETAIL_JSON_EACH_32(M,T,__VA_ARGS__)
+#define RPC_DETAIL_JSON_EACH_34(M,T,A,...) M(T,A), RPC_DETAIL_JSON_EACH_33(M,T,__VA_ARGS__)
+#define RPC_DETAIL_JSON_EACH_35(M,T,A,...) M(T,A), RPC_DETAIL_JSON_EACH_34(M,T,__VA_ARGS__)
+#define RPC_DETAIL_JSON_EACH_36(M,T,A,...) M(T,A), RPC_DETAIL_JSON_EACH_35(M,T,__VA_ARGS__)
+#define RPC_DETAIL_JSON_EACH_37(M,T,A,...) M(T,A), RPC_DETAIL_JSON_EACH_36(M,T,__VA_ARGS__)
+#define RPC_DETAIL_JSON_EACH_38(M,T,A,...) M(T,A), RPC_DETAIL_JSON_EACH_37(M,T,__VA_ARGS__)
+#define RPC_DETAIL_JSON_EACH_39(M,T,A,...) M(T,A), RPC_DETAIL_JSON_EACH_38(M,T,__VA_ARGS__)
+#define RPC_DETAIL_JSON_EACH_40(M,T,A,...) M(T,A), RPC_DETAIL_JSON_EACH_39(M,T,__VA_ARGS__)
+#define RPC_DETAIL_JSON_EACH_41(M,T,A,...) M(T,A), RPC_DETAIL_JSON_EACH_40(M,T,__VA_ARGS__)
+#define RPC_DETAIL_JSON_EACH_42(M,T,A,...) M(T,A), RPC_DETAIL_JSON_EACH_41(M,T,__VA_ARGS__)
+#define RPC_DETAIL_JSON_EACH_43(M,T,A,...) M(T,A), RPC_DETAIL_JSON_EACH_42(M,T,__VA_ARGS__)
+#define RPC_DETAIL_JSON_EACH_44(M,T,A,...) M(T,A), RPC_DETAIL_JSON_EACH_43(M,T,__VA_ARGS__)
+#define RPC_DETAIL_JSON_EACH_45(M,T,A,...) M(T,A), RPC_DETAIL_JSON_EACH_44(M,T,__VA_ARGS__)
+#define RPC_DETAIL_JSON_EACH_46(M,T,A,...) M(T,A), RPC_DETAIL_JSON_EACH_45(M,T,__VA_ARGS__)
+#define RPC_DETAIL_JSON_EACH_47(M,T,A,...) M(T,A), RPC_DETAIL_JSON_EACH_46(M,T,__VA_ARGS__)
+#define RPC_DETAIL_JSON_EACH_48(M,T,A,...) M(T,A), RPC_DETAIL_JSON_EACH_47(M,T,__VA_ARGS__)
+#define RPC_DETAIL_JSON_EACH_49(M,T,A,...) M(T,A), RPC_DETAIL_JSON_EACH_48(M,T,__VA_ARGS__)
+#define RPC_DETAIL_JSON_EACH_50(M,T,A,...) M(T,A), RPC_DETAIL_JSON_EACH_49(M,T,__VA_ARGS__)
+#define RPC_DETAIL_JSON_EACH_51(M,T,A,...) M(T,A), RPC_DETAIL_JSON_EACH_50(M,T,__VA_ARGS__)
+#define RPC_DETAIL_JSON_EACH_52(M,T,A,...) M(T,A), RPC_DETAIL_JSON_EACH_51(M,T,__VA_ARGS__)
+#define RPC_DETAIL_JSON_EACH_53(M,T,A,...) M(T,A), RPC_DETAIL_JSON_EACH_52(M,T,__VA_ARGS__)
+#define RPC_DETAIL_JSON_EACH_54(M,T,A,...) M(T,A), RPC_DETAIL_JSON_EACH_53(M,T,__VA_ARGS__)
+#define RPC_DETAIL_JSON_EACH_55(M,T,A,...) M(T,A), RPC_DETAIL_JSON_EACH_54(M,T,__VA_ARGS__)
+#define RPC_DETAIL_JSON_EACH_56(M,T,A,...) M(T,A), RPC_DETAIL_JSON_EACH_55(M,T,__VA_ARGS__)
+#define RPC_DETAIL_JSON_EACH_57(M,T,A,...) M(T,A), RPC_DETAIL_JSON_EACH_56(M,T,__VA_ARGS__)
+#define RPC_DETAIL_JSON_EACH_58(M,T,A,...) M(T,A), RPC_DETAIL_JSON_EACH_57(M,T,__VA_ARGS__)
+#define RPC_DETAIL_JSON_EACH_59(M,T,A,...) M(T,A), RPC_DETAIL_JSON_EACH_58(M,T,__VA_ARGS__)
+#define RPC_DETAIL_JSON_EACH_60(M,T,A,...) M(T,A), RPC_DETAIL_JSON_EACH_59(M,T,__VA_ARGS__)
+#define RPC_DETAIL_JSON_EACH_61(M,T,A,...) M(T,A), RPC_DETAIL_JSON_EACH_60(M,T,__VA_ARGS__)
+#define RPC_DETAIL_JSON_EACH_62(M,T,A,...) M(T,A), RPC_DETAIL_JSON_EACH_61(M,T,__VA_ARGS__)
+#define RPC_DETAIL_JSON_EACH_63(M,T,A,...) M(T,A), RPC_DETAIL_JSON_EACH_62(M,T,__VA_ARGS__)
+#define RPC_DETAIL_JSON_EACH_64(M,T,A,...) M(T,A), RPC_DETAIL_JSON_EACH_63(M,T,__VA_ARGS__)
+#define RPC_DETAIL_JSON_EACH(M, T, ...) RPC_DETAIL_JSON_JOIN(RPC_DETAIL_JSON_EACH_, RPC_DETAIL_JSON_COUNT(__VA_ARGS__))(M, T, __VA_ARGS__)
+// 1 to 64 fields, mapped under their member names.
 #define RPC_JSON_FIELDS(Type, ...) \
     template <> struct rpc::json_traits<Type> { \
-        static auto fields() { \
-            return std::make_tuple(RPC_DETAIL_JSON_JOIN(RPC_DETAIL_JSON_FIELDS_, RPC_DETAIL_JSON_COUNT(__VA_ARGS__))(Type, __VA_ARGS__)); \
+        static auto fields() { return std::make_tuple(RPC_DETAIL_JSON_EACH(RPC_DETAIL_JSON_FIELD, Type, __VA_ARGS__)); } \
+    }
+// 1 to 64 enumerators, carried as their names.
+#define RPC_JSON_ENUM(Type, ...) \
+    template <> struct rpc::json_enum_traits<Type> { \
+        static std::vector<::rpc::json_enumerator_descriptor<Type>> values() { \
+            return {RPC_DETAIL_JSON_EACH(RPC_DETAIL_JSON_ENUMERATOR, Type, __VA_ARGS__)}; \
         } \
     }

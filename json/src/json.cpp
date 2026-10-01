@@ -127,8 +127,14 @@ public:
         if (depth_ == 0 || size > context_.limits.max_string_bytes) return false;
         auto &frame = frames_[depth_ - 1];
         if (frame.kind != node_kind::object || frame.has_pending || frame.count >= context_.limits.max_object_fields) return false;
+        auto const *operations = frame.value.operations;
+        if (operations && operations->entry) { // A map: every key is new, or the object is rejected.
+            frame.pending = operations->entry(context_, frame.value.target, text, size);
+            if (!frame.pending.operations) return false;
+            ++frame.count; frame.has_pending = true; return true;
+        }
         std::size_t index = std::numeric_limits<std::size_t>::max();
-        frame.pending = frame.value.operations ? frame.value.operations->field(frame.value.target, text, size, index) : node{};
+        frame.pending = operations ? operations->field(frame.value.target, text, size, index) : node{};
         if (frame.pending.operations) {
             auto const bit = std::uint64_t{1} << index;
             if (frame.seen & bit) return false;
@@ -168,7 +174,7 @@ private:
         if (depth_ >= context_.limits.max_depth) return false;
         node value;
         if (!take(value) || (value.operations && value.operations->kind != kind)) return false;
-        if (value.operations) value.operations->reset(value.target);
+        if (value.operations) value.operations->reset(context_, value.target);
         auto &frame = frames_[depth_++];
         frame.value = value; frame.pending = {}; frame.kind = kind; frame.has_pending = false;
         frame.seen = 0; frame.count = 0; frame.unknown_keys.clear(); return true;

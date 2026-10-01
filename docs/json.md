@@ -42,11 +42,41 @@ RPC_JSON_FIELDS(GetUserReply, name);
 rpc::json_method<GetUserRequest, GetUserReply> const get_user{"users/GetUser"};
 ```
 
-宏放在全局命名空间，支持 1–16 个字段；映射不侵入结构体，也不改变该类型的其它 codec。
-支持 bool、有符号/无符号整数、float/double、std::string、嵌套映射结构体及 std::vector；
-暂不支持 optional、map、枚举、指针、字符串视图或 vector<bool>。每对象最多映射 64 个字段。
+宏放在全局命名空间，支持 1–64 个字段，也是每个对象能映射的上限；映射不侵入结构体，也不改变该类型的其它 codec。
+字段可以是：
 
-需要别名、必填字段或超过 16 个字段时手写 traits：
+| C++ 类型 | JSON |
+| --- | --- |
+| bool、有符号/无符号整数、float/double、std::string | 布尔、数字、字符串 |
+| 映射过的结构体 | 对象 |
+| `std::vector<T>` | 数组 |
+| `std::map<std::string, T>`、`std::unordered_map<std::string, T>` | 键任意的对象 |
+| 用 `RPC_JSON_ENUM` 命名过的枚举 | 值的名字 |
+| `std::unique_ptr<T>`；C++17 起还有 `std::optional<T>` | `T` 或 null |
+
+不支持：裸指针，因为所有权不明；字符串视图，因为解码结果必须拥有自己的存储；`vector<bool>`；键不是字符串的 map；
+没有命名的枚举，因为把越界整数转换成枚举是未定义行为。
+
+```cpp
+enum class Role { reader, writer };
+RPC_JSON_ENUM(Role, reader, writer); // "reader" / "writer"
+
+struct Profile {
+    Role role = Role::reader;
+    std::unique_ptr<std::string> nickname;        // 可缺省
+    std::map<std::string, std::uint32_t> quotas;  // {"disk":10,...}
+};
+RPC_JSON_FIELDS(Profile, role, nickname, quotas);
+```
+
+- **枚举：** 名字必须唯一；同一个值有几个名字时写第一个。未知名字、数字和 null 都拒绝，没有名字的值编码失败。
+  名字表在首次使用时验证；需要别名或改名时，手写 `json_enum_traits<E>::values()`，返回 `json_enumerator(name, value)` 列表。
+- **可空字段：** 缺失和 null 都解成空值。编码时空字段直接省略，在数组和 map 里写成 null。
+  必填的可空字段要求键存在，值可以是 null。`unique_ptr` 新分配的 `sizeof(T)` 计入解码逻辑字节。
+- **map：** 条目数受“单对象字段数量”上限约束，键计入解码逻辑字节。重复键（包括转义后同名的键）整条消息拒绝。
+  `std::map` 按键序输出，`unordered_map` 的输出顺序不确定。
+
+需要别名或必填字段时手写 traits：
 
 ```cpp
 template <> struct rpc::json_traits<GetUserRequest> {
@@ -58,8 +88,8 @@ template <> struct rpc::json_traits<GetUserRequest> {
 
 这是对宏定义的替代，同一类型只能定义一次 traits。字段名存储须保活到程序退出。
 重复或无效映射在取得 codec 时抛出 invalid_argument；嵌套映射在首次使用时验证。
-所有映射字段都会编码。缺失的非必填字段取 `T{}` 的默认值，保留成员默认初始化器；
-未知字段完整校验后忽略。null 不会隐式变成字段默认值，已有字段类型必须匹配。
+除空的可空字段外，所有映射字段都会编码。缺失的非必填字段取 `T{}` 的默认值，保留成员默认初始化器；
+未知字段完整校验后忽略。只有可空字段接受 null，其它字段不会把 null 当成默认值，已有字段类型必须匹配。
 
 服务端业务函数保持明确的请求与响应类型：
 

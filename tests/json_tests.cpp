@@ -12,6 +12,42 @@ struct Recursive { std::vector<Recursive> children; };
 struct Invalid { int a = 0, b = 0; };
 RPC_JSON_FIELDS(Item, id, text);
 RPC_JSON_FIELDS(Message, item, numbers, active, real, large, single);
+
+enum class Color { red, green, blue, unnamed };
+enum Size { small_size, large_size };
+enum class Twice { first, second };
+struct Shapes {
+    Color color = Color::green;
+    Size size = small_size;
+    std::vector<Color> palette;
+    std::unique_ptr<int> count;
+    std::unique_ptr<Item> item;
+    std::vector<std::unique_ptr<int>> holes;
+    std::map<std::string, int> scores;
+    std::unordered_map<std::string, std::vector<Item>> groups;
+    std::map<std::string, std::unique_ptr<Color>> maybe;
+};
+struct Wide {
+    int f1 = 0, f2 = 0, f3 = 0, f4 = 0, f5 = 0, f6 = 0, f7 = 0, f8 = 0, f9 = 0, f10 = 0;
+    int f11 = 0, f12 = 0, f13 = 0, f14 = 0, f15 = 0, f16 = 0, f17 = 0, f18 = 0, f19 = 0, f20 = 0;
+};
+struct Present { std::unique_ptr<int> value; };
+struct Duplicated { Twice twice = Twice::first; };
+RPC_JSON_ENUM(Color, red, green, blue);
+RPC_JSON_ENUM(Size, small_size, large_size);
+RPC_JSON_FIELDS(Shapes, color, size, palette, count, item, holes, scores, groups, maybe);
+RPC_JSON_FIELDS(Wide, f1, f2, f3, f4, f5, f6, f7, f8, f9, f10, f11, f12, f13, f14, f15, f16, f17, f18, f19, f20);
+RPC_JSON_FIELDS(Duplicated, twice);
+namespace rpc {
+template <> struct json_traits<Present> {
+    static auto fields() { return std::make_tuple(json_field("value", &Present::value, true)); }
+};
+template <> struct json_enum_traits<Twice> {
+    static std::vector<json_enumerator_descriptor<Twice>> values() {
+        return {json_enumerator("same", Twice::first), json_enumerator("same", Twice::second)};
+    }
+};
+}
 RPC_JSON_FIELDS(Limited, text, values);
 RPC_JSON_FIELDS(Recursive, children);
 RPC_JSON_FIELDS(MemoryLimited, text);
@@ -70,6 +106,57 @@ void rejected() {
     CHECK(rpc::json_codec<Message>::encode_bounded(m, {bytes, sizeof(bytes)}).code == rpc::wire::error::invalid_argument);
     m.real = 0; m.item.text.assign(1, char(0xFF)); CHECK(rpc::json_codec<Message>::encode_bounded(m, {bytes, sizeof(bytes)}).code == rpc::wire::error::invalid_argument);
 }
+void enums() {
+    Shapes s; s.color = Color::blue; s.size = large_size; s.palette = {Color::red, Color::green};
+    auto const bytes = encode(s);
+    CHECK(bytes.find(R"("color":"blue")") != std::string::npos && bytes.find(R"("size":"large_size")") != std::string::npos);
+    Shapes out; CHECK(decode(bytes, out));
+    CHECK(out.color == Color::blue && out.size == large_size && out.palette == s.palette);
+    for (auto const *bad : {R"({"color":"purple"})", R"({"color":2})", R"({"color":null})", R"({"palette":["red",1]})",
+                            R"({"color":"Blue"})"})
+        CHECK(!decode(bad, out));
+    s.color = Color::unnamed; std::uint8_t buffer[1024];
+    CHECK(rpc::json_codec<Shapes>::encode_bounded(s, {buffer, sizeof(buffer)}).code == rpc::wire::error::invalid_argument);
+    bool rejected = false; try { rpc::json_codec<Shapes>::upper_bound(s); } catch (std::invalid_argument const &) { rejected = true; } CHECK(rejected);
+    Duplicated d; rejected = false;
+    try { decode(R"({"twice":"same"})", d); } catch (std::invalid_argument const &) { rejected = true; } CHECK(rejected);
+}
+void nullable() {
+    Shapes s; auto bytes = encode(s);
+    CHECK(bytes.find("count") == std::string::npos && bytes.find("\"item\"") == std::string::npos); // Empty fields are left out.
+    s.count.reset(new int(7)); s.item.reset(new Item{}); s.item->id = 5;
+    s.holes.emplace_back(new int(1)); s.holes.emplace_back(); s.holes.emplace_back(new int(3));
+    bytes = encode(s);
+    CHECK(bytes.find(R"("holes":[1,null,3])") != std::string::npos);
+    Shapes out; CHECK(decode(bytes, out));
+    CHECK(out.count && *out.count == 7 && out.item && out.item->id == 5 && out.item->text == "default");
+    CHECK(out.holes.size() == 3 && *out.holes[0] == 1 && !out.holes[1] && *out.holes[2] == 3);
+    CHECK(decode(R"({"count":null,"item":null})", out) && !out.count && !out.item);
+    CHECK(decode(R"({"item":{}})", out) && out.item && out.item->id == 9 && !out.count);
+    for (auto const *bad : {R"({"count":"7"})", R"({"item":7})", R"({"count":{}})", R"({"holes":[[]]})"}) CHECK(!decode(bad, out));
+    Present p; CHECK(!decode("{}", p)); CHECK(decode(R"({"value":null})", p) && !p.value);
+    CHECK(decode(R"({"value":4})", p) && p.value && *p.value == 4);
+}
+void maps() {
+    Shapes s; s.scores = {{"a", 1}, {"b\"c", -2}, {"", 0}};
+    s.groups["x"] = {Item{}, Item{}}; s.groups["y"] = {};
+    s.maybe["on"].reset(new Color(Color::red)); s.maybe["off"];
+    auto const bytes = encode(s);
+    CHECK(bytes.find(R"("scores":{"":0,"a":1,"b\"c":-2})") != std::string::npos);
+    CHECK(bytes.find(R"("maybe":{"off":null,"on":"red"})") != std::string::npos);
+    Shapes out; CHECK(decode(bytes, out));
+    CHECK(out.scores == s.scores && out.groups.size() == 2 && out.groups["x"].size() == 2 && out.groups["y"].empty());
+    CHECK(out.maybe.size() == 2 && !out.maybe["off"] && *out.maybe["on"] == Color::red);
+    CHECK(decode(R"({"scores":{}})", out) && out.scores.empty());
+    for (auto const *bad : {R"({"scores":{"a":1,"a":2}})", R"({"scores":{"a":1,"\u0061":2}})", R"({"scores":{"a":"1"}})",
+                            R"({"scores":[1]})", R"({"scores":null})", R"({"groups":{"x":{}}})"})
+        CHECK(!decode(bad, out));
+}
+void wide() {
+    Wide w; w.f1 = 1; w.f20 = 20;
+    Wide out; CHECK(decode(encode(w), out) && out.f1 == 1 && out.f20 == 20);
+    CHECK(decode(R"({"f17":17})", out) && out.f17 == 17 && out.f1 == 0);
+}
 void limits() {
     Limited l; CHECK(!decode(R"({"values":[1,2,3]})", l));
     CHECK(!decode("{\"text\":\"" + std::string(33, 'a') + "\"}", l));
@@ -84,6 +171,9 @@ void limits() {
 }
 }
 int main() {
-    try { values(); rejected(); limits(); std::cout << "PASS JSON mapping, strict input, limits\n"; }
+    try {
+        values(); rejected(); limits(); std::cout << "PASS JSON mapping, strict input, limits\n";
+        enums(); nullable(); maps(); wide(); std::cout << "PASS JSON enums, nullable fields, maps, 20 fields\n";
+    }
     catch (std::exception const &error) { std::cerr << error.what() << '\n'; return 1; }
 }
