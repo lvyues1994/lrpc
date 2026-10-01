@@ -20,12 +20,20 @@ struct response_state;
 struct server_access;
 } // namespace detail
 
-// Valid until the handler completes. Do not keep copies of the stop token
-// beyond that: an unrequested stop state is reused by later calls.
+// Valid until the handler completes. A call that was never asked to stop
+// passes its stop state on to a later call, so a token for work that may
+// outlive the handler must come from stop_token(); one read from the
+// handler's environment (net::this_coro::stop_token) must not outlive it.
 struct server_context {
     clock::time_point deadline = clock::time_point::max();
-    net::stop_token stop_token{};
     wire::metadata_view metadata{};
+
+    bool stop_requested() const noexcept { return stop_.stop_requested(); }
+    // May outlive the handler: this call's stop state is then not passed on.
+    net::stop_token stop_token() noexcept {
+        shared_ = true;
+        return stop_;
+    }
 
     // As response_writer::set_trailer, for handlers that only see the context.
     bool set_trailer(wire::bytes_view message, wire::metadata_list metadata = {}) noexcept;
@@ -33,6 +41,8 @@ struct server_context {
 private:
     friend struct detail::server_access;
     detail::response_state *response_ = nullptr;
+    net::stop_token stop_{};
+    bool shared_ = false;
 };
 
 // Response storage owned by the call, bounded by the method's declared

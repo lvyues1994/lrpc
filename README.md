@@ -85,6 +85,8 @@ ctest --preset protobuf
 - 请求、回复缓冲、`call_spec`、`response_trailer` 和请求 metadata 须保活到调用完成；binding 借用的 handler/service 须保活到服务端排空。
 - `call_spec::deadline` 是绝对截止，`timeout` 是额外的相对上限，两者取较早值；下游调用传入 `server_context::deadline` 即可继承截止。
 - 调用继承等待方协程的 stop token，允许其它线程请求停止。
+- handler 用 `context.stop_requested()` 检查停止。要交给可能活过 handler 的工作，用 `context.stop_token()` 取 token；
+  从协程环境读到的 token 不能留到 handler 结束后，因为没被请求停止的停止状态会交给后续调用。
 - 每个方法声明 `max_response_bytes` 和 `max_trailer_bytes`。handler 用 `set_trailer(message, metadata)` 设置状态说明和响应 metadata；
   客户端在 `response_trailer::storage` 提供缓冲，放不下时 `truncated` 为真。状态说明只随错误状态发送。
 - `server.drain()` 发 GOAWAY、完成已接纳的调用后关闭连接；`close()` 取消全部。关闭后仍须运行事件循环消费完成事件，再销毁 context。

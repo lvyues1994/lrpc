@@ -39,18 +39,21 @@ struct stream_handler final : rpc::stream_method_handler {
     unsigned fan_out = 0;
     unsigned stopped = 0;
     unsigned finished = 0;
+    bool keep_token = false; // Keep the stream's token past the stream.
+    net::stop_token kept{};
 };
 
 auto serve(stream_handler &self, rpc::server_context &context, rpc::server_stream &stream)
     CO2_BEG(net::task<rpc::status_code>, (self, context, stream), rpc::stream_read read; rpc::status_code wrote;
             net::io_result<> slept; std::uint64_t total = 0; std::array<std::uint8_t, 8> encoded{}; unsigned i = 0;
             std::vector<std::uint8_t> payload;) {
+    if (self.keep_token) self.kept = context.stop_token();
     if (self.behaviour == mode::flood) { // Large messages until the client goes away.
         payload.assign(300000, 4);
         for (;;) {
             CO2_AWAIT_SET(wrote, stream.write({payload.data(), payload.size()}));
             if (wrote != rpc::status_code::ok) {
-                CHECK(context.stop_token.stop_requested());
+                CHECK(context.stop_requested());
                 ++self.stopped;
                 CO2_RETURN(wrote);
             }
@@ -60,7 +63,7 @@ auto serve(stream_handler &self, rpc::server_context &context, rpc::server_strea
         if (self.read_delay_ms != 0) CO2_AWAIT_SET(slept, net::delay(milliseconds{self.read_delay_ms}));
         CO2_AWAIT_SET(read, stream.read());
         if (read.code != rpc::status_code::ok) {
-            CHECK(context.stop_token.stop_requested());
+            CHECK(context.stop_requested());
             ++self.stopped;
             CO2_RETURN(read.code);
         }
@@ -360,6 +363,35 @@ auto cross_thread(fixture &f)
 }
 CO2_END
 
+// A token taken by a stream handler outlives its stream and never sees a later stream's stop.
+auto kept_token(fixture &f)
+    CO2_BEG(net::task<>, (f), rpc::status_code connected; rpc::open_result opened; rpc::status_code wrote;
+            rpc::stream_read read; rpc::call_result result; int spins = 0;) {
+    CO2_AWAIT_SET(connected, f.client.connect(f.endpoint));
+    CHECK(connected == rpc::status_code::ok);
+    f.handler.keep_token = true;
+    CO2_AWAIT_SET(opened, f.client.open(f.bidi, rpc::method_kind::bidirectional));
+    CO2_AWAIT_SET(wrote, opened.stream.writes_done());
+    CHECK(wrote == rpc::status_code::ok);
+    CO2_AWAIT_SET(read, opened.stream.read());
+    CHECK(read.code == rpc::status_code::ok && read.ended);
+    CO2_AWAIT_SET(result, opened.stream.finish());
+    CHECK(result.code == rpc::status_code::ok);
+    f.handler.keep_token = false;
+    CHECK(!f.handler.kept.stop_possible()); // Its stream is over and will never stop.
+    f.handler.behaviour = mode::hang;
+    CO2_AWAIT_SET(opened, f.client.open(f.bidi, rpc::method_kind::bidirectional));
+    opened.stream.cancel();
+    opened.stream = {};
+    for (spins = 0; f.handler.stopped < 1; ++spins) {
+        CHECK(spins < 2000);
+        CO2_AWAIT(net::delay(milliseconds{1}));
+    }
+    CHECK(!f.handler.kept.stop_requested());
+    CO2_RETURN();
+}
+CO2_END
+
 // A server write waiting on the stream is ended by the client's CANCEL.
 auto abandoned_server_write(fixture &f)
     CO2_BEG(net::task<>, (f), rpc::status_code connected; rpc::open_result opened; rpc::stream_read read;
@@ -607,6 +639,7 @@ int main(int argc, char **argv) {
         { fixture f{small_frames(64U << 10)}; f.run([&] { return flow_control(f); }); std::cout << "PASS flow control\n"; }
         { fixture f; f.run([&] { return failures(f); }); std::cout << "PASS error, cancel, deadline\n"; }
         { fixture f; f.run([&] { return cross_thread(f); }); std::cout << "PASS cross-thread stop\n"; }
+        { fixture f; f.run([&] { return kept_token(f); }); std::cout << "PASS kept token outlives its stream\n"; }
         {
             fixture f;
             f.run([&] { return abandoned_server_write(f); });

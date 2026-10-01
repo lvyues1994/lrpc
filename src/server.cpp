@@ -83,8 +83,7 @@ struct server_call final : stream_state, response_state {
     std::size_t request_charge = 0;
     server_context context{};
     response_writer writer{};
-    // Reused while no stop was requested; the context documents that its
-    // token does not outlive the handler.
+    // Reused while no stop was requested and the handler took no token.
     net::stop_source stop{co2::nostopstate};
     net::io_env env{};
     net::task<status_code> task{};
@@ -136,6 +135,12 @@ struct server_stream_call final : stream_core, response_state {
 struct server_access {
     static void bind(response_writer &writer, response_state *call) noexcept { writer.call_ = call; }
     static void bind(server_context &context, response_state *call) noexcept { context.response_ = call; }
+    static void set_stop(server_context &context, net::stop_token token) noexcept {
+        context.stop_ = std::move(token);
+        context.shared_ = false;
+    }
+    // The handler took a token that may outlive the call.
+    static bool stop_shared(server_context const &context) noexcept { return context.shared_; }
 };
 
 struct wire_method {
@@ -168,8 +173,8 @@ struct server_core : std::enable_shared_from_this<server_core> {
     session *sessions = nullptr;
     server_stats stats{};
     server_call *free_calls = nullptr;
-    // As a unary call keeps its own, a finished stream leaves an unrequested
-    // stop state for the next one.
+    // As a unary call keeps its own, a finished stream that was never asked
+    // to stop, and whose handler took no token, leaves its stop state here.
     std::vector<net::stop_source> spare_stops;
     bool draining = false;
     bool closed = false;
@@ -408,9 +413,9 @@ void server_core::release_call(server_call &call) noexcept {
     call.request = {};
     call.context.deadline = clock::time_point::max();
     call.context.metadata = {};
-    if (call.stop.stop_requested()) {
+    if (call.stop.stop_requested() || server_access::stop_shared(call.context)) {
         call.stop = net::stop_source{co2::nostopstate};
-        call.context.stop_token = {};
+        server_access::set_stop(call.context, {});
         call.env = net::io_env{};
     }
     call.owner = nullptr;
@@ -584,8 +589,8 @@ bool session::on_request(wire::frame_view const &frame) noexcept {
         }
         if (!call->stop.stop_possible()) {
             call->stop = net::stop_source{};
-            call->context.stop_token = call->stop.get_token();
-            call->env = net::io_env{net::executor_ref{core->shard.executor}, call->context.stop_token,
+            server_access::set_stop(call->context, call->stop.get_token());
+            call->env = net::io_env{net::executor_ref{core->shard.executor}, call->stop.get_token(),
                                     core->frame_allocator};
         }
     } catch (std::bad_alloc const &) {
@@ -643,9 +648,9 @@ void session::start_stream(method_entry const &entry, wire::frame_view const &fr
     call->open(conn, entry.max_response);
     call->head_charge = frame.head.size;
     call->context.deadline = deadline;
-    call->context.stop_token = call->stop.get_token();
+    server_access::set_stop(call->context, call->stop.get_token());
     call->context.metadata = metadata;
-    call->env = net::io_env{net::executor_ref{core->shard.executor}, call->context.stop_token, core->frame_allocator};
+    call->env = net::io_env{net::executor_ref{core->shard.executor}, call->stop.get_token(), core->frame_allocator};
     streams.insert(*call);
     ++active;
     ++core->stats.active_calls;
@@ -758,7 +763,7 @@ void session::complete(server_stream_call &call, status_code code) noexcept {
     call.ended = true; // Held messages are freed without returning credit.
     call.abandon_write();
     call.conn = nullptr;
-    core->keep_stop(call.stop);
+    if (!server_access::stop_shared(call.context)) core->keep_stop(call.stop);
     destroy_in(core->shard.memory, &call);
     --active;
     if (goaway_sent && active == 0) conn.close_when_flushed();

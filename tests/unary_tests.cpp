@@ -36,6 +36,8 @@ struct echo_handler final : rpc::method_handler {
     bool hang = false;    // Sleep until stopped.
     bool doubled = false; // Reply twice the request, exceeding small method limits.
     int trailer = 0;      // 1: metadata with ok, 2: message with an error, 3: oversized.
+    bool keep_token = false; // Keep the call's token past the call.
+    net::stop_token kept{};
     std::vector<unsigned> order{};
 };
 
@@ -48,6 +50,7 @@ auto echo(echo_handler &self, rpc::server_context &context, bytes_view request, 
     CO2_BEG(net::task<rpc::status_code>, (self, context, request, response), net::io_result<> slept;
             std::vector<std::uint8_t> twice;) {
     ++self.calls;
+    if (self.keep_token) self.kept = context.stop_token();
     if (self.throws) throw std::runtime_error{"handler failure must not escape"};
     if (self.delayed && request.size != 0 && request.data[0] != 0) {
         CO2_AWAIT_SET(slept, net::delay(milliseconds{request.data[0]}));
@@ -55,7 +58,7 @@ auto echo(echo_handler &self, rpc::server_context &context, bytes_view request, 
         CO2_AWAIT_SET(slept, net::delay(std::chrono::seconds{30}));
     }
     if (slept.ec) {
-        CHECK(context.stop_token.stop_requested());
+        CHECK(context.stop_requested());
         ++self.stopped;
         CO2_RETURN(rpc::status_code::cancelled);
     }
@@ -404,6 +407,26 @@ auto cancel_race(fixture &f)
 }
 CO2_END
 
+// A token taken by the handler outlives its call and never sees a later call's stop.
+auto kept_token(fixture &f)
+    CO2_BEG(net::task<>, (f), rpc::status_code connected; rpc::call_result result; rpc::call_spec spec;) {
+    CO2_AWAIT_SET(connected, f.client.connect(f.endpoint));
+    CHECK(connected == rpc::status_code::ok);
+    f.handler.keep_token = true;
+    CO2_AWAIT_SET(result, f.client.call(f.echo_method, {}, {}));
+    CHECK(result.code == rpc::status_code::ok);
+    f.handler.keep_token = false;
+    CHECK(!f.handler.kept.stop_possible()); // Its call is over and will never stop.
+    f.handler.hang = true;
+    spec.timeout = std::chrono::microseconds{20000};
+    CO2_AWAIT_SET(result, f.client.call(f.echo_method, {}, {}, &spec));
+    CHECK(result.code == rpc::status_code::deadline_exceeded);
+    CO2_AWAIT(wait_until(f.handler.stopped, 1));
+    CHECK(!f.handler.kept.stop_requested());
+    CO2_RETURN();
+}
+CO2_END
+
 auto closing(fixture &f)
     CO2_BEG(net::task<>, (f), rpc::status_code connected; unsigned done = 0; std::array<rpc::call_result, 3> results{};
             rpc::call_result after; std::size_t i = 0;) {
@@ -529,6 +552,7 @@ int main(int argc, char **argv) {
             f.run([&] { return cancel_race(f); });
             std::cout << "PASS cross-thread cancel racing completion\n";
         }
+        { fixture f; f.run([&] { return kept_token(f); }); std::cout << "PASS kept token outlives its call\n"; }
         { fixture f; f.run([&] { return closing(f); }); std::cout << "PASS close fails in-flight calls\n"; }
         { fixture f; f.run([&] { return draining(f); }); std::cout << "PASS GOAWAY drain\n"; }
         { fixture f; f.run([&] { return fragmented(f); }); std::cout << "PASS fragmented reads and writes\n"; }
