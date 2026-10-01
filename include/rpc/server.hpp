@@ -90,6 +90,11 @@ struct method_binding {
     method_kind kind = method_kind::unary;
     stream_method_handler *stream_handler = nullptr; // Borrowed; every other kind.
     std::shared_ptr<void> owner{}; // Kept alive with the server, e.g. a typed adapter.
+    // The encoding's label, such as "json" or "proto"; one name may have a
+    // binding per label. A labelled call goes to the binding with its label,
+    // else to the unlabelled one; an unlabelled call to the unlabelled one,
+    // else to the first registered. Otherwise it is unimplemented.
+    std::string codec{};
 };
 
 struct server_options {

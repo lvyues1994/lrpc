@@ -232,7 +232,8 @@ error validate_head(frame_view const &frame, limits bounds) noexcept {
     switch (frame.header.type) {
     case frame_type::settings: return decode_settings(frame.head).code;
     case frame_type::request:
-        return decode_request_head(frame.head, (frame.header.flags & new_method) != 0).code;
+        return decode_request_head(frame.head, (frame.header.flags & new_method) != 0,
+                                   (bounds.features & method_codecs) != 0).code;
     case frame_type::end: {
         auto const result = decode_end_head(frame.head);
         if (result.code != error::none) return result.code;
@@ -400,7 +401,14 @@ encode_result encode_settings(settings const &value, mutable_bytes_view output) 
     return w.result();
 }
 
-decode_result<request_head_view> decode_request_head(bytes_view input, bool has_new_method) noexcept {
+bool valid_codec(bytes_view const label) noexcept {
+    if (!valid(label) || label.size > max_codec_size) return false;
+    for (std::size_t i = 0; i < label.size; ++i)
+        if (label.data[i] < 0x21U || label.data[i] > 0x7eU) return false;
+    return true;
+}
+
+decode_result<request_head_view> decode_request_head(bytes_view input, bool has_new_method, bool has_codec) noexcept {
     if (!valid(input)) return failed<request_head_view>(error::invalid_argument);
     if (input.size < 9 || input.size > max_head_size) return failed<request_head_view>(error::invalid_head);
     reader r{input};
@@ -409,6 +417,10 @@ decode_result<request_head_view> decode_request_head(bytes_view input, bool has_
     if (has_new_method) {
         value.method_name = r.field();
         if (value.method_name.size == 0) r.reject();
+        if (has_codec) {
+            value.codec = r.field();
+            if (r.code() == error::none && !valid_codec(value.codec)) r.reject();
+        }
     }
     value.metadata = read_metadata(r);
     if (r.code() != error::none) return failed<request_head_view>(r.code());
@@ -416,23 +428,34 @@ decode_result<request_head_view> decode_request_head(bytes_view input, bool has_
     return {value, error::none, input.size};
 }
 
-encode_result encode_request_head(request_head const &value, bool has_new_method,
-                                  mutable_bytes_view output) noexcept {
-    if (has_new_method == (value.method_name.size == 0)) return {error::invalid_head, 0};
+namespace {
+// The fields after the timeout; a label needs NEW_METHOD under method_codecs.
+void write_request_fields(writer &w, request_head const &value, bool has_new_method, bool has_codec) noexcept {
+    if (has_new_method == (value.method_name.size == 0) ||
+        (value.codec.size != 0 && !(has_new_method && has_codec)) || !valid_codec(value.codec)) {
+        w.reject(error::invalid_head);
+        return;
+    }
+    if (has_new_method) w.field(value.method_name);
+    if (has_new_method && has_codec) w.field(value.codec);
+    write_metadata(w, value.metadata);
+}
+} // namespace
+
+encode_result encode_request_head(request_head const &value, bool has_new_method, mutable_bytes_view output,
+                                  bool has_codec) noexcept {
     writer w{output};
     std::uint8_t timeout[8]{};
     store_le(value.timeout_us, timeout);
     w.put({timeout, sizeof(timeout)});
-    if (has_new_method) w.field(value.method_name);
-    write_metadata(w, value.metadata);
+    write_request_fields(w, value, has_new_method, has_codec);
     return w.result();
 }
-encode_result request_head_size(request_head const &value, bool has_new_method) noexcept {
-    if (has_new_method == (value.method_name.size == 0)) return {error::invalid_head, 0};
+encode_result request_head_size(request_head const &value, bool has_new_method, bool has_codec) noexcept {
     writer w;
     std::uint8_t timeout[8]{}; w.put({timeout, sizeof(timeout)});
-    if (has_new_method) w.field(value.method_name);
-    write_metadata(w, value.metadata); return w.result();
+    write_request_fields(w, value, has_new_method, has_codec);
+    return w.result();
 }
 
 decode_result<end_head_view> decode_end_head(bytes_view input) noexcept {

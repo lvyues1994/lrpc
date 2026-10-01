@@ -61,7 +61,9 @@ template <class Message> struct mapped_protobuf_codec {
     }
 };
 
+// The same bytes as the generated messages, so the same label.
 struct mapped_protobuf_codec_policy {
+    template <class Message> static char const *label() noexcept { return "proto"; }
     template <class Message> static codec_ops const &operations() { return mapped_protobuf_codec<Message>::operations(); }
 };
 

@@ -74,6 +74,17 @@ CO2_AWAIT_SET(result, opened.stream.finish(&trailer));
 
 类型化一元调用两端稳态都是 0 次堆分配。编码失败在发送前判 `invalid_argument`（`not_executed`）；服务端解码失败判 `invalid_argument`，内存不足判 `resource_exhausted`；服务端编码失败或回复超出 `max_response_bytes` 判 `internal`；客户端解码失败判 `internal`。
 
+### 编码标识与协商
+
+同一个方法名可以按编码各注册一个 binding（`method_binding::codec`，例如 `"json"`、`"proto"`）。编码标签挂在方法定义上，不随每次调用发送：
+
+- **协商：** 双方在 SETTINGS 的 features 里都声明 `wire::method_codecs`（0x08，默认开启）才启用；任一方没有声明时，连接按原来的语法工作，标签被忽略。
+- **线上格式：** 启用后，带 NEW_METHOD 的 REQUEST head 在方法名之后多一个长度前缀的标签字段，可以为空，至多 64 字节可见 ASCII。之后同一连接上的调用只带方法 ID，没有额外字节和解析。
+- **服务端选择：** 带标签的调用交给同名同标签的 binding，没有则交给同名的无标签 binding（它兜底接收任何编码）；不带标签的调用交给无标签 binding，没有则交给最先注册的那个。都没有时，这个方法 ID 在该连接上返回 `unimplemented` 并标记未执行，调用方可以换一种编码重试。
+- **标签来源：** 类型化层由 policy 给出（`rpc::codec_label<Message, Policy>()`）：`json_codec_policy` 是 `json`；生成的 protobuf 消息和 `mapped_protobuf_codec_policy` 是 `proto`，因为两者在线上是同样的字节；自定义 `codec<T>` 可以提供 `static char const *label()`。原始字节的 `bind(name)` 和 `method_binding` 默认不带标签。
+
+请求只能按客户端选定的编码发送，因为方法定义和第一次调用在同一帧里，没有往返。所以“协商”就是客户端声明编码、服务端按规则选择或明确拒绝，不由服务端替客户端换编码。
+
 `<rpc/service.hpp>` 的 `service_contract<Policy, Methods...>` 把一组方法的名字和类型放在一起，服务端 `bindings(...)` 与客户端 `bind_service(...)` 共用，见 [共享服务契约](service-contract.md)。protobuf 服务由 `protoc-gen-rpc` 生成，见 [protobuf 用法](protobuf.md)；普通结构体的 JSON 见 [JSON 用法](json.md)。
 
 ## 实测
@@ -115,4 +126,4 @@ CO2_AWAIT_SET(result, opened.stream.finish(&trailer));
 - 类型化流的编码缓冲每条流分配一次。
 - 已发出且结果未知的调用不重试。同一目标的各条连接各自解析，不共享结果；`close()` 打断不了进行中的 getaddrinfo，context 要等它返回才能排空。
 - 从 handler 协程环境读到的 stop token（`net::this_coro::stop_token`）不能留到 handler 结束后：没被请求停止的停止状态会交给后续调用。要留下来用的 token 须经 `server_context::stop_token()` 取，取过的停止状态不再交出去。
-- 同一方法名一次只注册一种编码，线上没有 codec 标识或协商。
+- 客户端事先不知道服务端支持哪些编码：标签不匹配要等第一次调用，才以 `unimplemented`（未执行）暴露。

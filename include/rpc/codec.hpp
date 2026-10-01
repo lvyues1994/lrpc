@@ -45,8 +45,33 @@ template <class Message> codec_ops const &codec_for() {
     return operations;
 }
 
+namespace detail {
+template <class...> using codec_void_t = void;
+template <class Message, class = void> struct codec_label_of {
+    static char const *get() noexcept { return ""; }
+};
+template <class Message> struct codec_label_of<Message, codec_void_t<decltype(codec<Message>::label())>> {
+    static char const *get() noexcept { return codec<Message>::label(); }
+};
+template <class Message, class Policy, class = void> struct policy_label {
+    static char const *get() noexcept { return ""; }
+};
+template <class Message, class Policy>
+struct policy_label<Message, Policy, codec_void_t<decltype(Policy::template label<Message>())>> {
+    static char const *get() noexcept { return Policy::template label<Message>(); }
+};
+} // namespace detail
+
+// A policy's label() names its encoding on the wire (see method_binding::codec).
 struct default_codec_policy {
     template <class Message> static codec_ops const &operations() { return codec_for<Message>(); }
+    // A codec<Message> specialization may provide static char const *label().
+    template <class Message> static char const *label() noexcept { return detail::codec_label_of<Message>::get(); }
 };
+
+// The label Policy gives Message, or "" for a policy without labels.
+template <class Message, class Policy = default_codec_policy> char const *codec_label() noexcept {
+    return detail::policy_label<Message, Policy>::get();
+}
 
 } // namespace rpc

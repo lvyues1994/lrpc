@@ -7,6 +7,7 @@
 #include <iostream>
 #include <limits>
 #include <random>
+#include <string>
 #include <vector>
 
 namespace w = rpc::wire;
@@ -238,6 +239,59 @@ void request_head_contract() {
     CHECK(same({buffer.data() + 8, rewritten.written - 8}, {golden.data() + 8, golden.size() - 8}));
 }
 
+// Under method_codecs a NEW_METHOD head carries the label after the name.
+void codec_label_contract() {
+    w::request_head labelled{7, literal("svc"), {}, literal("json")};
+    std::array<std::uint8_t, 128> buffer{};
+    auto const encoded = w::encode_request_head(labelled, true, writable(buffer), true);
+    std::array<std::uint8_t, 18> const golden{{7, 0, 0, 0, 0, 0, 0, 0, 3, 's', 'v', 'c', 4, 'j', 's', 'o', 'n', 0}};
+    CHECK(encoded.code == w::error::none && same({buffer.data(), encoded.written}, bytes(golden)));
+    CHECK(w::request_head_size(labelled, true, true).written == golden.size());
+    auto const decoded = w::decode_request_head(bytes(golden), true, true);
+    CHECK(decoded.code == w::error::none && same(decoded.value.codec, literal("json")) &&
+          same(decoded.value.method_name, literal("svc")) && decoded.value.metadata.count == 0);
+    CHECK(w::decode_request_head(bytes(golden), true, false).code == w::error::invalid_head); // Label read as metadata.
+    // An empty label still takes its length byte; heads of known methods carry none.
+    w::request_head unlabelled{7, literal("svc"), {}, {}};
+    auto const empty = w::encode_request_head(unlabelled, true, writable(buffer), true);
+    CHECK(empty.code == w::error::none && empty.written == 14 && buffer[12] == 0);
+    auto const plain = w::decode_request_head({buffer.data(), empty.written}, true, true);
+    CHECK(plain.code == w::error::none && plain.value.codec.size == 0);
+    w::request_head known{7, {}, {}, {}};
+    CHECK(w::encode_request_head(known, false, writable(buffer), true).written == 9);
+    CHECK(w::decode_request_head({buffer.data(), 9}, false, true).code == w::error::none);
+    // A label needs both NEW_METHOD and the feature, and visible ASCII within 64 bytes.
+    CHECK(w::encode_request_head(labelled, true, writable(buffer), false).code == w::error::invalid_head);
+    known.codec = literal("json");
+    CHECK(w::encode_request_head(known, false, writable(buffer), true).code == w::error::invalid_head);
+    for (auto const *label : {"two words", "tab\t", "\x7f"}) {
+        labelled.codec = {reinterpret_cast<std::uint8_t const *>(label), std::strlen(label)};
+        CHECK(w::encode_request_head(labelled, true, writable(buffer), true).code == w::error::invalid_head);
+    }
+    std::string const long_label(65, 'x');
+    labelled.codec = {reinterpret_cast<std::uint8_t const *>(long_label.data()), long_label.size()};
+    CHECK(!w::valid_codec(labelled.codec));
+    CHECK(w::encode_request_head(labelled, true, writable(buffer), true).code == w::error::invalid_head);
+    labelled.codec = {labelled.codec.data, 64};
+    CHECK(w::valid_codec(labelled.codec) &&
+          w::encode_request_head(labelled, true, writable(buffer), true).code == w::error::none);
+    auto spaced = golden;
+    spaced[13] = ' ';
+    CHECK(w::decode_request_head(bytes(spaced), true, true).code == w::error::invalid_head);
+    // decode_frame applies the negotiated features to REQUEST heads.
+    std::array<std::uint8_t, 16 + 18> frame{};
+    w::frame_header header{};
+    header.type = w::frame_type::request;
+    header.flags = w::new_method | w::end_stream;
+    header.stream_id = 1;
+    header.aux = 1;
+    header.length = header.head_length = 18;
+    CHECK(w::encode_header(header, {frame.data(), 16}).code == w::error::none);
+    std::copy(golden.begin(), golden.end(), frame.begin() + 16);
+    CHECK(w::decode_frame(bytes(frame), {1U << 20, 1U << 20, w::method_codecs}).code == w::error::none);
+    CHECK(w::decode_frame(bytes(frame)).code == w::error::invalid_head);
+}
+
 void end_head_contract() {
     std::array<std::uint8_t, 18> const internal{{
         2, 0, 0, 0, 1, 0, 0, 0, 4, 0, 2, 0, 13, 0, 0, 0, 0, 0}};
@@ -366,7 +420,7 @@ int main() {
         {"preface", preface_contract}, {"varint", varint_contract},
         {"frame golden/prefixes", frame_golden_and_prefixes}, {"header rejection", header_rejections},
         {"control frames", control_frames}, {"settings", settings_contract}, {"GOAWAY UTF-8", goaway_utf8},
-        {"request head", request_head_contract}, {"end head", end_head_contract},
+        {"request head", request_head_contract}, {"codec label", codec_label_contract}, {"end head", end_head_contract},
         {"hostile lengths", hostile_head_lengths}, {"storage guards", invalid_storage_and_guards},
         {"randomized roundtrips", randomized_roundtrips}, {"negotiated message grammar", extended_messages}};
     try {

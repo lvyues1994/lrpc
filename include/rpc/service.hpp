@@ -100,7 +100,8 @@ private:
     template <std::size_t... I>
     static std::array<method_ref, sizeof...(Methods)> bind_all(call_target target, contract_type const &contract,
                                                                 std::index_sequence<I...>) {
-        return {{target.bind(contract.template operation<I>().name)...}};
+        return {{target.bind(contract.template operation<I>().name,
+                             codec_label<typename contract_type::template method_type<I>::request_type, Policy>())...}};
     }
 
     call_target target_;

@@ -215,12 +215,14 @@ status_code plan_request(client_core &core, method_slot &slot, std::uint64_t con
     auto const &peer = core.conn->peer();
     plan.slot = &slot;
     plan.intern = slot.wire_id == 0;
+    plan.labelled = plan.intern && (core.conn->features() & wire::method_codecs) != 0;
     plan.wire_id = plan.intern ? core.next_method : slot.wire_id;
     if (plan.wire_id > peer.max_method_ids) return status_code::resource_exhausted;
     plan.head.timeout_us = timeout_us;
     if (plan.intern) plan.head.method_name = {reinterpret_cast<std::uint8_t const *>(slot.name.data()), slot.name.size()};
+    if (plan.labelled) plan.head.codec = {reinterpret_cast<std::uint8_t const *>(slot.codec.data()), slot.codec.size()};
     plan.head.metadata = metadata;
-    auto const head_size = wire::request_head_size(plan.head, plan.intern);
+    auto const head_size = wire::request_head_size(plan.head, plan.intern, plan.labelled);
     if (head_size.code != wire::error::none || head_size.written > 0xffffU) return status_code::invalid_argument;
     plan.head_size = head_size.written;
     if (plan.head_size > peer.max_frame_size) return status_code::resource_exhausted;
@@ -253,8 +255,8 @@ status_code write_request(client_core &core, request_plan const &plan, std::uint
     header.head_length = static_cast<std::uint16_t>(plan.head_size);
     header.aux = plan.wire_id;
     if (wire::encode_header(header, {frame, wire::header_size}, conn.outgoing()).code != wire::error::none ||
-        wire::encode_request_head(plan.head, plan.intern, {frame + wire::header_size, plan.head_size}).code !=
-            wire::error::none)
+        wire::encode_request_head(plan.head, plan.intern, {frame + wire::header_size, plan.head_size}, plan.labelled)
+                .code != wire::error::none)
         return status_code::internal;
     ++core.next_id;
     if (plan.intern) {
@@ -424,12 +426,17 @@ net::task<status_code> client::attach(std::unique_ptr<transport> link) {
     return detail::attach_client(core_, std::move(link));
 }
 
-method_ref client::bind(std::string const &name) {
-    auto &methods = core_->methods;
-    for (std::size_t index = 0; index != methods.size(); ++index)
-        if (methods[index].name == name) return method_ref{static_cast<std::uint32_t>(index + 1)};
-    methods.push_back(detail::method_slot{name, 0});
-    return method_ref{static_cast<std::uint32_t>(methods.size())};
+std::size_t detail::find_or_add(std::vector<method_slot> &slots, std::string const &name, std::string const &codec) {
+    for (std::size_t index = 0; index != slots.size(); ++index)
+        if (slots[index].name == name && slots[index].codec == codec) return index;
+    if (!wire::valid_codec({reinterpret_cast<std::uint8_t const *>(codec.data()), codec.size()}))
+        throw std::invalid_argument{"invalid codec label"};
+    slots.push_back(method_slot{name, codec, 0});
+    return slots.size() - 1;
+}
+
+method_ref client::bind(std::string const &name, std::string const &codec) {
+    return method_ref{static_cast<std::uint32_t>(detail::find_or_add(core_->methods, name, codec) + 1)};
 }
 
 bool client::ready() const noexcept { return core_->ready(); }

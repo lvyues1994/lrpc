@@ -25,7 +25,7 @@ extern "C" int LLVMFuzzerTestOneInput(std::uint8_t const *data, std::size_t size
             if (encoded[i] != data[i]) std::abort();
     } else if (frame.consumed != 0) std::abort();
     w::limits bounds{4U * 1024U * 1024U, 64U * 1024U * 1024U,
-        w::streaming | w::message_compression | w::explicit_rejection};
+        w::streaming | w::message_compression | w::explicit_rejection | w::method_codecs};
     auto const extended = w::decode_frame(input, bounds);
     if (extended.code == w::error::none) {
         std::array<std::uint8_t, 16> encoded{};
@@ -36,6 +36,8 @@ extern "C" int LLVMFuzzerTestOneInput(std::uint8_t const *data, std::size_t size
     w::decode_settings(input);
     w::decode_request_head(input, false);
     w::decode_request_head(input, true);
+    auto const labelled = w::decode_request_head(input, true, true);
+    if (labelled.code == w::error::none && !w::valid_codec(labelled.value.codec)) std::abort();
     w::decode_end_head(input);
     w::decode_metadata_entry(input);
     return 0;

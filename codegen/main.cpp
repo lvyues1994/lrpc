@@ -172,7 +172,9 @@ void write_stubs(pb::ServiceDescriptor const &service, std::ostream &out) {
     auto const count = service.method_count();
     if (count == 0) return;
     out << name << "Stub::" << name << "Stub(::rpc::call_target target)\n    : lrpc_target_(target), lrpc_methods_{{";
-    for (int i = 0; i < count; ++i) out << (i == 0 ? "" : ", ") << "target.bind(\"" << wire_name(*service.method(i)) << "\")";
+    for (int i = 0; i < count; ++i)
+        out << (i == 0 ? "" : ", ") << "target.bind(\"" << wire_name(*service.method(i)) << "\", ::rpc::codec_label<"
+            << message_type(service.method(i)->input_type()) << ">())";
     out << "}} {}\n\n";
     for (int i = 0; i < count; ++i) {
         auto const &method = *service.method(i);

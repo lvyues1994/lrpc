@@ -87,10 +87,20 @@ Policy 是契约类型的一部分，所以按启动配置选择编码时，在�
 
 ## 格式匹配与验证
 
-同一 wire 方法名一次只注册一种编码。server 与 client 必须配置匹配的契约；
-不同方法名可以在同一服务端、端口和连接使用不同格式。
-目前没有在线 codec 标识、协商或自动转码，不能保证选错格式一定被拒绝。
-这里的普通结构体 JSON 映射也不等于 protobuf JSON mapping。
+binding 和 stub 都带着 policy 的编码标签（JSON 是 `json`，映射 protobuf 与生成的 protobuf 消息都是 `proto`），
+所以一个服务端可以在同样的方法名下同时提供两种编码，各个 stub 按自己的标签选中对应的 binding：
+
+```cpp
+auto const json = example::users_contract(rpc::json_codec_policy{});
+auto const proto = example::users_contract(rpc::mapped_protobuf_codec_policy{});
+auto methods = example::users_bindings(json, service);
+for (auto &binding : example::users_bindings(proto, service)) methods.push_back(std::move(binding));
+rpc::server server{shard, std::move(methods)};
+```
+
+服务端没有客户端所用编码的 binding 时，调用以 `unimplemented` 结束并标记未执行，不会把字节交给另一种格式的解码器。
+没有标签的 binding（例如原始字节 handler）兜底接收任何编码；规则与线上格式见 [设计说明](design.md#编码标识与协商)。
+标签只做选择，不做转码。这里的普通结构体 JSON 映射也不等于 protobuf JSON mapping。
 
 同时启用 `LRPC_BUILD_JSON`、`LRPC_BUILD_PROTOBUF` 和 `LRPC_BUILD_CODEGEN` 后，
 同一 [双方法示例](../examples/json_users.cpp) 支持：
@@ -100,4 +110,4 @@ Policy 是契约类型的一部分，所以按启动配置选择编码时，在�
 ./build/protobuf-release/examples/json_users protobuf
 ```
 
-测试覆盖两种格式、直接 client 与 channel、trailer，以及与原生 protobuf 编码逐字节比较、单次转换、容量失败和编译期拒绝错误类型。
+测试覆盖两种格式、直接 client 与 channel、trailer、同一服务端同名提供两种格式，以及与原生 protobuf 编码逐字节比较、单次转换、容量失败和编译期拒绝错误类型。

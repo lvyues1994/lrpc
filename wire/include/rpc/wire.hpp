@@ -18,6 +18,10 @@ constexpr std::uint8_t not_executed = 0x10;
 constexpr std::uint32_t explicit_rejection = 0x01;
 constexpr std::uint32_t streaming = 0x02;
 constexpr std::uint32_t message_compression = 0x04;
+// A NEW_METHOD head names the encoding after the method: a label of at most
+// max_codec_size visible ASCII bytes, possibly empty.
+constexpr std::uint32_t method_codecs = 0x08;
+constexpr std::size_t max_codec_size = 64;
 
 // Borrowed storage. A nonzero size requires that many accessible bytes.
 // Decoded views remain valid only while the input is alive and unchanged.
@@ -131,16 +135,19 @@ struct metadata_view {
     std::size_t count = 0;
 };
 
+// On the wire the codec follows the method name.
 struct request_head {
     std::uint64_t timeout_us = 0;
     bytes_view method_name{};
     metadata_list metadata{};
+    bytes_view codec{}; // With NEW_METHOD under method_codecs only.
 };
 
 struct request_head_view {
     std::uint64_t timeout_us = 0;
     bytes_view method_name{};
     metadata_view metadata{};
+    bytes_view codec{};
 };
 
 struct end_head {
@@ -177,10 +184,13 @@ encode_result encode_message_descriptor(message_descriptor const &, mutable_byte
 // not need_more: callers must never extend a head into body or the next frame.
 decode_result<settings> decode_settings(bytes_view input) noexcept;
 encode_result encode_settings(settings const &value, mutable_bytes_view output) noexcept;
-decode_result<request_head_view> decode_request_head(bytes_view input, bool has_new_method) noexcept;
-encode_result encode_request_head(request_head const &value, bool has_new_method,
-                                  mutable_bytes_view output) noexcept;
-encode_result request_head_size(request_head const &value, bool has_new_method) noexcept;
+// has_codec: method_codecs was negotiated, so a NEW_METHOD head carries the label.
+decode_result<request_head_view> decode_request_head(bytes_view input, bool has_new_method,
+                                                     bool has_codec = false) noexcept;
+encode_result encode_request_head(request_head const &value, bool has_new_method, mutable_bytes_view output,
+                                  bool has_codec = false) noexcept;
+encode_result request_head_size(request_head const &value, bool has_new_method, bool has_codec = false) noexcept;
+bool valid_codec(bytes_view label) noexcept;
 decode_result<end_head_view> decode_end_head(bytes_view input) noexcept;
 encode_result encode_end_head(end_head const &value, mutable_bytes_view output) noexcept;
 encode_result encode_metadata(metadata_list value, mutable_bytes_view output) noexcept;

@@ -1,8 +1,9 @@
 # 普通 C++ 结构体与 JSON RPC
 
 `lrpc::json` 将普通结构体映射为现有 lrpc 消息 body 中的 UTF-8 JSON 对象。
-方法名、帧格式、状态、截止、取消与 metadata 沿用 lrpc；双方须为同一方法约定相同 codec。
-此模块不提供 HTTP 或 JSON-RPC 2.0 入口，protobuf 与 JSON 可以使用不同方法名共存。
+方法名、帧格式、状态、截止、取消与 metadata 沿用 lrpc；JSON 的 binding 和 stub 带编码标签 `json`，
+同一方法名可以同时有 protobuf 的 binding，见 [共享服务契约](service-contract.md#格式匹配与验证)。
+此模块不提供 HTTP 或 JSON-RPC 2.0 入口。
 
 ## 构建
 

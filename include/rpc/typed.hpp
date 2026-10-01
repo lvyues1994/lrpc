@@ -104,7 +104,9 @@ public:
     call_target(client &target) noexcept : client_(&target) {}
     call_target(channel &target) noexcept : channel_(&target) {}
 
-    method_ref bind(std::string const &name) const { return client_ ? client_->bind(name) : channel_->bind(name); }
+    method_ref bind(std::string const &name, std::string const &codec = {}) const {
+        return client_ ? client_->bind(name, codec) : channel_->bind(name, codec);
+    }
     unary_call call(method_ref method, request_body request, response_body response, call_spec const *spec,
                     response_trailer *trailer) const noexcept {
         return client_ ? client_->call(method, request, response, spec, trailer)
@@ -124,7 +126,7 @@ private:
 template <class Request, class Response, class Policy = default_codec_policy> class bound_method {
 public:
     bound_method(call_target target, method<Request, Response, Policy> const &operation)
-        : target_(target), method_(target.bind(operation.name)) {}
+        : target_(target), method_(target.bind(operation.name, codec_label<Request, Policy>())) {}
     unary_call operator()(Request const &request, Response &response, call_spec const *spec = nullptr,
                           response_trailer *trailer = nullptr) const noexcept {
         return target_.call(method_, encoded<Request, Policy>(request), decoded<Response, Policy>(response), spec,
@@ -252,7 +254,7 @@ private:
 template <class Request, class Response, class Policy = default_codec_policy> class bound_stream {
 public:
     bound_stream(call_target target, method<Request, Response, Policy> const &operation, method_kind kind)
-        : target_(target), method_(target.bind(operation.name)), kind_(kind) {}
+        : target_(target), method_(target.bind(operation.name, codec_label<Request, Policy>())), kind_(kind) {}
     typed_open_operation<Request, Response, Policy> operator()(call_spec const *spec = nullptr) const noexcept {
         return typed_open_operation<Request, Response, Policy>{target_.open(method_, kind_, spec)};
     }
@@ -380,6 +382,7 @@ method_binding bind_method(method<Request, Response, Policy> const &operation, S
     auto handler = std::make_shared<detail::typed_handler<Request, Response, Service, Policy>>(service, function);
     method_binding binding{};
     binding.name = operation.name;
+    binding.codec = codec_label<Request, Policy>();
     binding.handler = handler.get();
     binding.max_response_bytes = limits.max_response_bytes;
     binding.max_trailer_bytes = limits.max_trailer_bytes;
@@ -396,6 +399,7 @@ method_binding bind_stream_method(method<Request, Response, Policy> const &opera
     auto handler = std::make_shared<detail::typed_stream_handler<Request, Response, Service, Policy>>(service, function);
     method_binding binding{};
     binding.name = operation.name;
+    binding.codec = codec_label<Request, Policy>();
     binding.max_response_bytes = limits.max_response_bytes;
     binding.max_trailer_bytes = limits.max_trailer_bytes;
     binding.kind = kind;

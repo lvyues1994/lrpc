@@ -116,6 +116,47 @@ auto run(rpc::client *client, rpc::channel *channel, net::ip::tcp::endpoint endp
     CO2_RETURN();
 }
 CO2_END
+// One server answers the same names in both encodings; each stub's label picks its own.
+auto mixed(rpc::client *client, net::ip::tcp::endpoint endpoint, example::UserStub<rpc::json_codec_policy> json,
+           example::UserStub<rpc::mapped_protobuf_codec_policy> proto)
+    CO2_BEG(net::task<>, (client, endpoint, json, proto), rpc::status_code connected; rpc::call_result result;
+            example::GetUserRequest request{7}; example::GetUserReply reply; example::RenameUserRequest change;
+            example::RenameUserReply changed;) {
+    CO2_AWAIT_SET(connected, client->connect(endpoint));
+    CHECK(connected == rpc::status_code::ok);
+    CO2_AWAIT_SET(result, json.GetUser(request, reply));
+    CHECK(result.code == rpc::status_code::ok && reply.user.name == "Alice");
+    change.id = 7; change.name = "Bob";
+    CO2_AWAIT_SET(result, proto.RenameUser(change, changed));
+    CHECK(result.code == rpc::status_code::ok && changed.updated);
+    reply = {};
+    CO2_AWAIT_SET(result, json.GetUser(request, reply));
+    CHECK(result.code == rpc::status_code::ok && reply.user.name == "Bob" && reply.user.id == 7);
+    reply = {};
+    CO2_AWAIT_SET(result, proto.GetUser(request, reply));
+    CHECK(result.code == rpc::status_code::ok && reply.user.name == "Bob" && reply.user.roles.size() == 2);
+    CO2_RETURN();
+}
+CO2_END
+void both_encodings() {
+    net::io_context context{net::default_backend, net::single_thread_hint};
+    rpc::shard shard{context};
+    service implementation;
+    auto const json = example::users_contract(rpc::json_codec_policy{});
+    auto const proto = example::users_contract(rpc::mapped_protobuf_codec_policy{});
+    auto methods = example::users_bindings(json, implementation);
+    for (auto &binding : example::users_bindings(proto, implementation)) methods.push_back(std::move(binding));
+    rpc::server server{shard, std::move(methods)};
+    auto const endpoint = server.listen({net::ip::address_v4::loopback(), 0});
+    rpc::client client{shard};
+    std::exception_ptr failure;
+    auto close = [&] { client.close(); server.close(); };
+    net::run_async(context.get_executor(), close, [&](std::exception_ptr e) { failure = e; close(); })([&] {
+        return mixed(&client, endpoint, example::UserStub<rpc::json_codec_policy>{client, json},
+                     example::UserStub<rpc::mapped_protobuf_codec_policy>{client, proto});
+    });
+    context.run(); if (failure) std::rethrow_exception(failure);
+}
 template <class Policy> void round_trip(Policy policy, bool use_channel) {
     net::io_context context{net::default_backend, net::single_thread_hint};
     rpc::shard shard{context};
@@ -142,5 +183,7 @@ int main() {
             round_trip(rpc::mapped_protobuf_codec_policy{}, c);
         }
         std::cout << "PASS shared struct service over JSON and mapped protobuf, client and channel, trailer\n";
+        both_encodings();
+        std::cout << "PASS one server, both encodings under the same names\n";
     } catch (std::exception const &e) { std::cerr << e.what() << '\n'; return 1; }
 }

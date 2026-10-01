@@ -559,6 +559,7 @@ private:
 };
 
 struct json_codec_policy {
+    template <class Message> static char const *label() noexcept { return "json"; }
     template <class Message> static codec_ops const &operations() {
         static codec_ops const value{
             [](void const *p) { return json_codec<Message>::size(*static_cast<Message const *>(p)); },

@@ -58,7 +58,7 @@ public:
 
     // ok once a connection is ready; unavailable after close; deadline_exceeded.
     net::task<status_code> wait_ready(clock::time_point deadline = clock::time_point::max());
-    method_ref bind(std::string const &name);
+    method_ref bind(std::string const &name, std::string const &codec = {}); // As client::bind.
     unary_call call(method_ref method, request_body request, response_body response, call_spec const *spec = nullptr,
                     response_trailer *trailer = nullptr) noexcept;
     // On the least loaded ready connection; streams are not retried.

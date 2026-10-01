@@ -16,10 +16,14 @@ enum : std::uint8_t { call_idle = 0, call_pending = 1, call_done = 2 };
 
 struct method_slot {
     std::string name;
+    std::string codec; // Sent with NEW_METHOD when the peer takes labels.
     // Wire ID on this connection, zero until NEW_METHOD is queued. IDs are
     // handed out in order of first use; streaming peers reject other orders.
     std::uint32_t wire_id = 0;
 };
+// Index of the slot for name and codec, appended if new. Throws
+// std::invalid_argument for an invalid label.
+std::size_t find_or_add(std::vector<method_slot> &slots, std::string const &name, std::string const &codec);
 
 // Chooses the connection for each attempt of a routed call.
 struct call_router {
@@ -82,6 +86,7 @@ struct request_plan {
     std::size_t payload = 0;
     std::uint32_t wire_id = 0;
     bool intern = false;
+    bool labelled = false; // The NEW_METHOD head carries the codec field.
 };
 // A bounded body may be given less room than its size.
 status_code plan_request(client_core &core, method_slot &slot, std::uint64_t timeout_us, wire::metadata_list metadata,

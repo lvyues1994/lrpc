@@ -78,7 +78,7 @@ struct channel_core final : call_router {
 
     std::shared_ptr<client_core> make_client() {
         auto created = std::make_shared<client_core>(shard, options.client);
-        for (auto const &name : methods) created->methods.push_back(method_slot{name, 0});
+        created->methods = methods; // Wire IDs are per connection: all still zero.
         return created;
     }
     std::size_t ready_count() const noexcept {
@@ -114,7 +114,7 @@ struct channel_core final : call_router {
     channel_options const options;
     std::vector<channel_target> targets;
     std::vector<subchannel> subs;
-    std::vector<std::string> methods;
+    std::vector<method_slot> methods;
     std::size_t cursor = 0;
     net::stop_source stop; // Interrupts reconnection backoff and connects.
     ready_waiter *waiters = nullptr;
@@ -249,14 +249,14 @@ net::task<status_code> channel::wait_ready(clock::time_point const deadline) {
     return detail::wait_ready_task(core_, deadline);
 }
 
-method_ref channel::bind(std::string const &name) {
+method_ref channel::bind(std::string const &name, std::string const &codec) {
     auto &methods = core_->methods;
-    for (std::size_t index = 0; index != methods.size(); ++index)
-        if (methods[index] == name) return method_ref{static_cast<std::uint32_t>(index + 1)};
-    methods.push_back(name);
-    for (auto &sub : core_->subs)
-        if (sub.client) sub.client->methods.push_back(detail::method_slot{name, 0});
-    return method_ref{static_cast<std::uint32_t>(methods.size())};
+    auto const known = methods.size();
+    auto const index = detail::find_or_add(methods, name, codec);
+    if (index == known)
+        for (auto &sub : core_->subs)
+            if (sub.client) sub.client->methods.push_back(detail::method_slot{name, codec, 0});
+    return method_ref{static_cast<std::uint32_t>(index + 1)};
 }
 
 unary_call channel::call(method_ref method, request_body request, response_body response, call_spec const *spec,

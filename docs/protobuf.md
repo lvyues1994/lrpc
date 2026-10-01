@@ -101,6 +101,9 @@ codec 是同步回调，不得等待所属 `io_context`。错误映射：
 不用 protobuf 时，特化 `rpc::codec<Message>`，使用 `rpc::method<Request, Response>{"完整名"}`、
 `rpc::bind(client, method)` 和 `rpc::bind_method(...)`。
 
+protobuf codec 的编码标签是 `proto`，生成的 binding 和 Stub 都带着它，所以同名方法可以在同一服务端另有 JSON 实现。
+自定义 codec 可以提供 `static char const *label()` 声明自己的标签，不提供就是无标签。规则见 [设计说明](design.md#编码标识与协商)。
+
 ## 状态说明与 metadata
 
 请求 metadata 放在 `call_spec::metadata`，服务端从 `server_context::metadata` 读取；描述符及键值在调用完成前保持有效。

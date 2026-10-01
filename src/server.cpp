@@ -25,6 +25,7 @@ constexpr std::size_t end_head_bytes = 2;                                   // E
 
 struct method_entry {
     std::string name;
+    std::string codec;
     method_handler *handler;
     stream_method_handler *stream_handler;
     method_kind kind;
@@ -154,7 +155,7 @@ struct server_core : std::enable_shared_from_this<server_core> {
     server_core(server_core const &) = delete;
     server_core &operator=(server_core const &) = delete;
 
-    method_entry const *find(wire::bytes_view name) const noexcept;
+    method_entry const *find(wire::bytes_view name, wire::bytes_view codec) const noexcept;
     bool attach(std::unique_ptr<transport> link) noexcept;
     void drain() noexcept;
     void close() noexcept;
@@ -371,13 +372,16 @@ server_core::server_core(shard_state &state, std::vector<method_binding> binding
     for (auto &binding : bindings) {
         bool const unary = binding.kind == method_kind::unary;
         if (binding.name.empty() || binding.max_trailer_bytes > 0xffffU || binding.kind > method_kind::bidirectional ||
-            (unary ? binding.handler == nullptr : binding.stream_handler == nullptr))
+            (unary ? binding.handler == nullptr : binding.stream_handler == nullptr) ||
+            !wire::valid_codec({reinterpret_cast<std::uint8_t const *>(binding.codec.data()), binding.codec.size()}))
             throw std::invalid_argument{"invalid method binding"};
         for (auto const &existing : methods)
-            if (existing.name == binding.name) throw std::invalid_argument{"duplicate method " + binding.name};
-        methods.push_back(method_entry{std::move(binding.name), binding.handler, binding.stream_handler, binding.kind,
-                                       binding.max_response_bytes, binding.max_trailer_bytes,
-                                       std::move(binding.owner)});
+            if (existing.name == binding.name && existing.codec == binding.codec)
+                throw std::invalid_argument{"duplicate method " + binding.name +
+                                            (binding.codec.empty() ? std::string{} : " (" + binding.codec + ")")};
+        methods.push_back(method_entry{std::move(binding.name), std::move(binding.codec), binding.handler,
+                                       binding.stream_handler, binding.kind, binding.max_response_bytes,
+                                       binding.max_trailer_bytes, std::move(binding.owner)});
     }
     shard.endpoint_opened();
 }
@@ -390,10 +394,19 @@ server_core::~server_core() {
     }
 }
 
-method_entry const *server_core::find(wire::bytes_view const name) const noexcept {
-    for (auto const &entry : methods)
-        if (entry.name.size() == name.size && std::memcmp(entry.name.data(), name.data, name.size) == 0) return &entry;
-    return nullptr;
+method_entry const *server_core::find(wire::bytes_view const name, wire::bytes_view const codec) const noexcept {
+    auto const same = [](std::string const &text, wire::bytes_view bytes) {
+        return text.size() == bytes.size && (bytes.size == 0 || std::memcmp(text.data(), bytes.data, bytes.size) == 0);
+    };
+    method_entry const *first = nullptr;
+    method_entry const *unlabelled = nullptr;
+    for (auto const &entry : methods) {
+        if (!same(entry.name, name)) continue;
+        if (codec.size != 0 && same(entry.codec, codec)) return &entry;
+        if (first == nullptr) first = &entry;
+        if (entry.codec.empty() && unlabelled == nullptr) unlabelled = &entry;
+    }
+    return unlabelled != nullptr || codec.size != 0 ? unlabelled : first;
 }
 
 server_call &server_core::acquire_call() {
@@ -534,7 +547,7 @@ bool session::on_request(wire::frame_view const &frame) noexcept {
     last_request = header.stream_id;
     bool const defines = (header.flags & wire::new_method) != 0;
     bool const streaming = (header.flags & wire::end_stream) == 0;
-    auto const head = wire::decode_request_head(frame.head, defines);
+    auto const head = wire::decode_request_head(frame.head, defines, (conn.features() & wire::method_codecs) != 0);
     if (head.code != wire::error::none) return false;
     if (header.aux >= ids.size()) {
         if (!defines) {
@@ -551,7 +564,7 @@ bool session::on_request(wire::frame_view const &frame) noexcept {
     if (defines) {
         if (slot.defined || head.value.method_name.size > conn.options.max_method_name_bytes) return false;
         slot.defined = true; // Survives a refusal below.
-        slot.entry = core->find(head.value.method_name);
+        slot.entry = core->find(head.value.method_name, head.value.codec);
     }
     if (goaway_sent || core->draining) return reject(header.stream_id, status_code::unavailable), true;
     if (!slot.defined) return reject(header.stream_id, status_code::failed_precondition), true;

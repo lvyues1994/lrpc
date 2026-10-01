@@ -84,7 +84,9 @@ public:
 
     net::task<status_code> connect(net::ip::tcp::endpoint endpoint);
     net::task<status_code> attach(std::unique_ptr<transport> link);
-    method_ref bind(std::string const &name);
+    // codec labels the encoding of the method's messages (see
+    // method_binding::codec); a name may be bound once per label.
+    method_ref bind(std::string const &name, std::string const &codec = {});
     unary_call call(method_ref method, request_body request, response_body response, call_spec const *spec = nullptr,
                     response_trailer *trailer = nullptr) noexcept {
         return unary_call{core_.get(), nullptr, method.index, request, response, spec, trailer};

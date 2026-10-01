@@ -15,7 +15,7 @@ struct connection_options {
     // the frame limit leaves room for the head (deadline, method, metadata).
     // Streams are flow controlled per stream, a whole message at a time.
     wire::settings receive{(1U << 20) + (16U << 10), 1U << 20, 1024, 1U << 20, 4096, 0,
-                           wire::explicit_rejection | wire::streaming};
+                           wire::explicit_rejection | wire::streaming | wire::method_codecs};
     // Fixed read window. Frames that do not fit are read into a dedicated
     // buffer, so this bounds idle per-connection memory, not the frame size.
     std::size_t receive_buffer_bytes = 64U * 1024U;

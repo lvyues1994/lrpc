@@ -12,6 +12,7 @@ namespace rpc {
 
 template <class Message>
 struct codec<Message, typename std::enable_if<std::is_base_of<google::protobuf::MessageLite, Message>::value>::type> {
+    static char const *label() noexcept { return "proto"; }
     static std::size_t size(Message const &value) { return value.ByteSizeLong(); }
     static bool encode(Message const &value, wire::mutable_bytes_view output) {
         if (output.size > static_cast<std::size_t>(std::numeric_limits<int>::max()) ||
