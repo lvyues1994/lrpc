@@ -25,7 +25,7 @@ CO2_AWAIT_SET(result, client.call(echo, request, response, &spec)); // result.co
 
 `spec`（截止、相对超时、请求 metadata）可省略；取消来自等待方的 stop token，可以从任意线程发出。请求、响应缓冲、`spec` 和 `response_trailer` 借用到调用完成。
 
-`channel` 面向一组固定端点，每个端点维持 `connections_per_endpoint` 条连接，断开后在后台按指数退避重连；每次调用发往在飞调用最少的就绪连接。调用失败且能证明服务端没有执行（发送前就失败、END 带 `not_executed`、GOAWAY 表明服务端没处理该流）时，换一条连接透明重试，最多 `max_attempts` 次，截止时间沿用第一次算出的绝对时刻；没有别的连接可换时，调用以最后一次尝试的状态结束。`call_result::not_executed` 把同样的判断交给调用方。
+`channel` 面向一组固定端点或具名目标（`channel_target{host, service}`），每个端点或目标维持 `connections_per_endpoint` 条连接，断开后在后台按指数退避重连。具名目标在建连前经 context 的解析线程调用 getaddrinfo 解析，也可以用 `channel_options::resolve` 换成自己的查询（例如服务发现）。同一目标的各条连接从不同地址起步，连接失败就换下一个地址；上次结果超过 `resolve_interval`，或结果里的地址都失败过，才重新解析，解析失败时沿用上次的结果。每次调用发往在飞调用最少的就绪连接。调用失败且能证明服务端没有执行（发送前就失败、END 带 `not_executed`、GOAWAY 表明服务端没处理该流）时，换一条连接透明重试，最多 `max_attempts` 次，截止时间沿用第一次算出的绝对时刻；没有别的连接可换时，调用以最后一次尝试的状态结束。`call_result::not_executed` 把同样的判断交给调用方。
 
 ```cpp
 rpc::channel channel{shard, {endpoint_a, endpoint_b}};
@@ -113,6 +113,6 @@ CO2_AWAIT_SET(result, opened.stream.finish(&trailer));
 
 - 写进内核收发缓冲的字节无法再调整顺序：与批量流共用一条连接的调用，仍要排在流窗口内已写出的数据之后（见实测）。对延迟敏感的调用，宜给批量流用较小的窗口或单独的连接。
 - 类型化流的编码缓冲每条流分配一次。
-- 端点列表是固定的，没有名字解析；已发出且结果未知的调用不重试。
+- 已发出且结果未知的调用不重试。同一目标的各条连接各自解析，不共享结果；`close()` 打断不了进行中的 getaddrinfo，context 要等它返回才能排空。
 - 从 handler 协程环境读到的 stop token（`net::this_coro::stop_token`）不能留到 handler 结束后：没被请求停止的停止状态会交给后续调用。要留下来用的 token 须经 `server_context::stop_token()` 取，取过的停止状态不再交出去。
 - 同一方法名一次只注册一种编码，线上没有 codec 标识或协商。

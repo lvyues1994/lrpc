@@ -79,7 +79,7 @@ ctest --preset protobuf
 ## 调用与资源约定
 
 - 每个 `io_context` 建一个 `rpc::shard`，其上的 server、client、channel 及其全部调用都在该 context 的线程执行，包括析构。
-- client 先等待 `connect()` 成功再调用；多端点、后台重连、负载均衡和未执行调用的重试用 `rpc::channel`。
+- client 先等待 `connect()` 成功再调用；多端点、具名目标（DNS 或自定义查询）、后台重连、负载均衡和未执行调用的重试用 `rpc::channel`。
 - `client.bind(name)` 做一次名字查找，得到只适用于该 client/channel 的 `method_ref`；之后 `call(method, request, response, &spec, &trailer)`
   返回可直接等待的 `unary_call`，结果是 `call_result{code, size, not_executed}`。
 - 请求、回复缓冲、`call_spec`、`response_trailer` 和请求 metadata 须保活到调用完成；binding 借用的 handler/service 须保活到服务端排空。

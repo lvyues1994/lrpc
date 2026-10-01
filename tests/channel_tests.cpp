@@ -63,6 +63,14 @@ struct fixture {
         echo_method = created->bind("test/Echo");
         return created;
     }
+    std::unique_ptr<rpc::channel> open(std::vector<rpc::channel_target> targets, rpc::channel_options options = {}) {
+        options.initial_backoff = milliseconds{5};
+        options.max_backoff = milliseconds{40};
+        std::unique_ptr<rpc::channel> created{new rpc::channel(shard, std::move(targets), options)};
+        echo_method = created->bind("test/Echo");
+        return created;
+    }
+    static std::string port(backend const &server) { return std::to_string(server.endpoint.port()); }
 
     template <class F> void run(F factory) {
         std::exception_ptr failure;
@@ -85,7 +93,17 @@ struct fixture {
     backend b;
     std::unique_ptr<rpc::channel> channel;
     rpc::method_ref echo_method;
+    std::vector<std::vector<net::ip::tcp::endpoint>> answers; // One per lookup through the hook; the last repeats.
+    std::size_t lookups = 0;
 };
+
+auto answer(fixture &f)
+    CO2_BEG(net::task<std::vector<net::ip::tcp::endpoint>>, (f), std::vector<net::ip::tcp::endpoint> result;) {
+    result = f.answers[std::min(f.lookups, f.answers.size() - 1)];
+    ++f.lookups;
+    CO2_RETURN(std::move(result));
+}
+CO2_END
 
 auto call_once(rpc::channel &channel, rpc::method_ref method, bytes_view request, mutable_bytes_view response)
     CO2_BEG(net::task<rpc::call_result>, (channel, method, request, response), rpc::call_result result;) {
@@ -220,6 +238,93 @@ auto waiting(fixture &f)
 }
 CO2_END
 
+// "localhost" may also answer ::1, where nothing listens: its connections move on to 127.0.0.1.
+auto named(fixture &f)
+    CO2_BEG(net::task<>, (f), unsigned failed = 0; rpc::channel_options options;) {
+    options.connections_per_endpoint = 2;
+    f.channel = f.open({{"localhost", fixture::port(f.a)}, {"127.0.0.1", fixture::port(f.b)}}, options);
+    CO2_AWAIT(until_ready(*f.channel, 4));
+    CO2_AWAIT(burst(f, 1000, 32, &failed));
+    CHECK(failed == 0 && f.a.handler.calls + f.b.handler.calls == 1000);
+    CHECK(f.a.handler.calls > 200 && f.b.handler.calls > 200);
+    CO2_RETURN();
+}
+CO2_END
+
+// A target that does not resolve leaves the channel to the others, and never becomes ready alone.
+auto unresolved(fixture &f)
+    CO2_BEG(net::task<>, (f), unsigned failed = 0; rpc::status_code ready; std::unique_ptr<rpc::channel> lone;
+            std::chrono::steady_clock::time_point started;) {
+    f.channel = f.open({{"localhost", "no-such-service-lrpc"}, {"127.0.0.1", fixture::port(f.a)}});
+    CO2_AWAIT(until_ready(*f.channel, 1));
+    CO2_AWAIT(burst(f, 200, 16, &failed));
+    CHECK(failed == 0 && f.a.handler.calls == 200);
+    lone.reset(new rpc::channel(f.shard, std::vector<rpc::channel_target>{{"localhost", "no-such-service-lrpc"}}));
+    started = std::chrono::steady_clock::now();
+    CO2_AWAIT_SET(ready, lone->wait_ready(started + milliseconds{60}));
+    CHECK(ready == rpc::status_code::deadline_exceeded && lone->ready_connections() == 0);
+    lone->close();
+    CO2_RETURN();
+}
+CO2_END
+
+rpc::channel_options discovery(fixture &f) {
+    rpc::channel_options options{};
+    options.resolve = [&f](rpc::channel_target const &target) {
+        CHECK(target.host == "pool" && target.service == "echo");
+        return answer(f);
+    };
+    return options;
+}
+
+// Through the hook: a dead first address is skipped, and once every address
+// of the answer has failed, the target is looked up again.
+auto discovered(fixture &f)
+    CO2_BEG(net::task<>, (f), unsigned failed = 0; std::unique_ptr<net::tcp_acceptor> probe;
+            net::ip::tcp::endpoint dead; std::error_code error; int i = 0;) {
+    probe.reset(new net::tcp_acceptor(f.context, {net::ip::address_v4::loopback(), 0}));
+    dead = probe->local_endpoint(error);
+    CHECK(!error);
+    probe.reset();
+    f.answers = {{dead, f.a.endpoint}, {f.b.endpoint}};
+    f.channel = f.open({{"pool", "echo"}}, discovery(f));
+    CO2_AWAIT(until_ready(*f.channel, 1));
+    CHECK(f.lookups == 1);
+    CO2_AWAIT(burst(f, 100, 8, &failed));
+    CHECK(failed == 0 && f.a.handler.calls == 100);
+    f.a.server->close();
+    for (i = 0; f.channel->ready_connections() != 0; ++i) {
+        CHECK(i < 3000);
+        CO2_AWAIT(net::delay(milliseconds{1}));
+    }
+    CO2_AWAIT(until_ready(*f.channel, 1));
+    CHECK(f.lookups == 2);
+    CO2_AWAIT(burst(f, 100, 8, &failed));
+    CHECK(failed == 0 && f.b.handler.calls == 100);
+    CO2_RETURN();
+}
+CO2_END
+
+// A named target reconnects through a fresh lookup after its server restarts.
+auto named_reconnect(fixture &f)
+    CO2_BEG(net::task<>, (f), rpc::call_result result; std::array<std::uint8_t, 8> request{};
+            std::array<std::uint8_t, 8> reply{}; rpc::channel_options options; int i = 0;) {
+    options.resolve_interval = milliseconds{1};
+    f.channel = f.open({{"127.0.0.1", fixture::port(f.a)}}, options);
+    CO2_AWAIT(until_ready(*f.channel, 1));
+    f.a.server->close();
+    for (i = 0; f.channel->ready_connections() != 0; ++i) {
+        CHECK(i < 3000);
+        CO2_AWAIT(net::delay(milliseconds{1}));
+    }
+    f.a.restart(f.shard);
+    CO2_AWAIT(until_ready(*f.channel, 1));
+    CO2_AWAIT_SET(result, f.channel->call(f.echo_method, {request.data(), 8}, {reply.data(), 8}));
+    CHECK(result.code == rpc::status_code::ok);
+    CO2_RETURN();
+}
+CO2_END
+
 } // namespace
 
 int main(int argc, char **argv) {
@@ -234,6 +339,10 @@ int main(int argc, char **argv) {
         { fixture f; f.run([&] { return failover(f); }); std::cout << "PASS failover and reconnect\n"; }
         { fixture f; f.run([&] { return drained(f); }); std::cout << "PASS GOAWAY reroutes\n"; }
         { fixture f; f.run([&] { return waiting(f); }); std::cout << "PASS wait_ready deadline and close\n"; }
+        { fixture f; f.run([&] { return named(f); }); std::cout << "PASS named targets\n"; }
+        { fixture f; f.run([&] { return unresolved(f); }); std::cout << "PASS unresolvable target\n"; }
+        { fixture f; f.run([&] { return discovered(f); }); std::cout << "PASS lookup hook, address failover\n"; }
+        { fixture f; f.run([&] { return named_reconnect(f); }); std::cout << "PASS named target reconnects\n"; }
     } catch (std::exception const &error) {
         std::cerr << error.what() << '\n';
         return 1;
