@@ -400,7 +400,8 @@ auto drive(client_side &self)
     CHECK(double(after.client_writes - before.client_writes) <= 0.1 * workers * 200);
     CHECK(double(after.server_writes - before.server_writes) <= 0.1 * workers * 200);
 
-    // 4 KiB calls overflow a receive buffer per turn; replies must still leave in batches.
+    // 64 calls of 4 KiB fill four receive buffers: the reader ends a turn
+    // after each, so replies leave about once per buffer, still in batches.
     for (i = 0; i < workers; ++i) self.large_requests[i].fill(static_cast<std::uint8_t>(i));
     for (round = 0; round < 2; ++round) {
         self.done.remaining = workers;
@@ -412,10 +413,7 @@ auto drive(client_side &self)
     report("64 in flight, 4 KiB", before, after, workers * 200.0);
     CHECK(after.client_allocations == before.client_allocations);
     CHECK(after.server_allocations == before.server_allocations);
-    // Readiness backends read the whole burst inline; io_uring completes each
-    // receive buffer's read on its own, and the writer runs between them.
-    CHECK(double(after.server_writes - before.server_writes) <=
-          (selected_backend == net::backend_kind::io_uring ? 0.1 : 0.05) * workers * 200);
+    CHECK(double(after.server_writes - before.server_writes) <= 0.1 * workers * 200);
     CO2_RETURN();
 }
 CO2_END
