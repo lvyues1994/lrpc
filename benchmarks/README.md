@@ -60,6 +60,17 @@ CPU 亲和不等于独占 CPU，请同时查看环境文件中的 SMT、频率�
 `--frame-allocator system|recycling`、`--receive-buffer-bytes N`、`--samples path.csv`。raw 不实现逐调用截止。
 单次运行阶段含预热有 30 秒看门狗，随后关闭并用 `context.run()` 排空；suite 另对客户端进程设 60 秒超时。
 
+## 混合负载
+
+`mixed_bench` 测量与批量流共用一条连接时的一元延迟。服务端和客户端各一个线程，走一条回环 TCP。客户端在一条双向流上持续写
+`--bulk-bytes` 大小的消息（默认 1 MiB，0 表示不开批量流），同时逐个发 `--bytes`（默认 64 B）的回显调用。输出一元调用的
+p50/p99/p999/max 和批量吞吐。`--window` 设流窗口，也就是在途批量字节的上限；`--fragment-bytes`、`--send-budget`、
+`--receive-buffer-bytes` 覆盖对应的连接选项。`bench` preset 会一起构建它：
+
+```sh
+taskset -c 2,4 ./build/bench/benchmarks/mixed_bench --bulk-bytes 1048576 --window 4194304 --calls 20000
+```
+
 ## 分配诊断
 
 `--frame-allocator recycling` 使用 net 的 `recycling_memory_resource` 复用协程帧，工具默认使用 system。

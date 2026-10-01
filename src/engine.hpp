@@ -28,6 +28,19 @@ protected:
 enum class phase : std::uint8_t { idle, handshaking, ready, closed };
 enum class parse_step : std::uint8_t { parsed, need_bytes, failed };
 
+// A stream message framed one fragment at a time. While the connection's
+// stream budget is spent, sources wait in turn for the writer.
+struct fragment_source {
+    // Queues the next fragment; true while more remain. May close the connection.
+    virtual bool next_fragment() noexcept = 0;
+    fragment_source *prev_source = nullptr;
+    fragment_source *next_source = nullptr;
+    bool waiting = false;
+
+protected:
+    ~fragment_source() = default;
+};
+
 // Framing, handshake and I/O for one transport. Frames are parsed in place
 // from one receive window and sent from a chain of contiguous chunks, so a
 // turn's worth of frames leaves in one write.
@@ -50,6 +63,13 @@ public:
     // A frame without body; END carries the minimal empty head. Closes the
     // connection and returns false when out of memory.
     bool send_control(wire::frame_type type, std::uint32_t stream, std::uint32_t aux, std::uint8_t flags) noexcept;
+
+    // A stream may frame a fragment now: none is waiting and the budget is not spent.
+    bool stream_room() const noexcept {
+        return sources_head_ == nullptr && tx_bytes_ < options.stream_send_budget;
+    }
+    void queue_stream(fragment_source &source) noexcept;
+    void unqueue_stream(fragment_source &source) noexcept; // No-op unless it waits.
 
     void close() noexcept;
     void close_when_flushed() noexcept;
@@ -83,6 +103,7 @@ private:
     bool resize_receive(std::size_t capacity) noexcept;
     bool dispatch(wire::frame_view const &frame) noexcept;
     std::size_t gather(net::const_buffer *buffers, std::size_t limit) const noexcept;
+    void refill() noexcept;
     void consume(std::size_t bytes) noexcept;
     void release_tx() noexcept;
     void release_rx() noexcept;
@@ -109,11 +130,14 @@ private:
     std::size_t rx_capacity_ = 0;
     std::size_t rx_begin_ = 0;
     std::size_t rx_end_ = 0;
+    std::size_t turn_bytes_ = 0; // Parsed since the reader last yielded.
 
     std::vector<chunk> chunks_; // Ring; the size is a power of two.
     std::size_t chunk_head_ = 0;
     std::size_t chunk_count_ = 0;
     std::size_t tx_bytes_ = 0;
+    fragment_source *sources_head_ = nullptr;
+    fragment_source *sources_tail_ = nullptr;
 
     event writer_wake_;
     event reader_wake_;

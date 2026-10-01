@@ -25,6 +25,8 @@ constexpr std::size_t settings_bytes = 64; // Seven varint pairs, generously.
 struct connection_io {
     static bool closed(connection const &c) noexcept { return c.state_ == phase::closed; }
     static parse_step parse(connection &c) noexcept { return c.parse(); }
+    static bool turn_spent(connection const &c) noexcept { return c.turn_bytes_ >= c.options.receive_buffer_bytes; }
+    static void new_turn(connection &c) noexcept { c.turn_bytes_ = 0; }
     static bool pause(connection &c) noexcept {
         if (!c.server_side_ || c.tx_bytes_ <= c.options.tx_high_watermark) return false;
         c.reader_paused_ = true;
@@ -41,6 +43,8 @@ struct connection_io {
     static std::size_t gather(connection const &c, net::const_buffer *buffers, std::size_t limit) noexcept {
         return c.gather(buffers, limit);
     }
+    static void refill(connection &c) noexcept { c.refill(); }
+    static bool streams_waiting(connection const &c) noexcept { return c.sources_head_ != nullptr; }
     static void consume(connection &c, std::size_t const bytes) noexcept { c.consume(bytes); }
     static void exited(connection &c) noexcept { c.io_exited(); }
 };
@@ -58,8 +62,11 @@ auto reader_loop(std::shared_ptr<void> keep, connection *c)
         }
         outcome = connection_io::parse(*c);
         if (outcome == parse_step::parsed) {
-            if (++turn >= c->options.frames_per_turn) {
+            // Reads may complete inline, so a receive buffer's worth of frames
+            // also ends a turn: bulk data must not hold back the writer.
+            if (++turn >= c->options.frames_per_turn || connection_io::turn_spent(*c)) {
                 turn = 0;
+                connection_io::new_turn(*c);
                 CO2_AWAIT(yield_awaiter{});
             }
             continue;
@@ -86,6 +93,8 @@ auto writer_loop(std::shared_ptr<void> keep, connection *c)
             std::array<net::const_buffer, net::max_iovec> buffers{}; std::size_t count = 0;) {
     for (;;) {
         if (connection_io::closed(*c)) break;
+        connection_io::refill(*c);
+        if (connection_io::closed(*c)) break;
         if (c->queued_bytes() == 0) {
             if (connection_io::flushed_close(*c)) {
                 c->close();
@@ -102,6 +111,9 @@ auto writer_loop(std::shared_ptr<void> keep, connection *c)
             break;
         }
         connection_io::consume(*c, sent.value);
+        // Writes may complete inline as well: between budgets of stream data,
+        // let the reader take what has arrived.
+        if (connection_io::streams_waiting(*c)) CO2_AWAIT(yield_awaiter{});
     }
     connection_io::exited(*c);
     CO2_RETURN();
@@ -130,6 +142,8 @@ void connection::start(std::shared_ptr<void> keep) {
         throw std::invalid_argument{"receive buffer too small"};
     if ((options.receive.compression & ~compression_algorithms()) != 0 || options.preferred_compression > 2)
         throw std::invalid_argument{"compression unavailable in this build"};
+    if (options.stream_fragment_bytes == 0 || options.stream_send_budget == 0)
+        throw std::invalid_argument{"stream fragment and budget must be nonzero"};
     chunks_.resize(4);
     if (!resize_receive(options.receive_buffer_bytes)) throw std::bad_alloc{};
     std::size_t const prefix = server_side_ ? 0 : wire::preface_size;
@@ -182,12 +196,14 @@ parse_step connection::parse() noexcept {
             auto *const head = rx_ + rx_begin_ + wire::header_size;
             wire::frame_view const frame{h, {head, h.head_length}, {head + h.head_length, h.length - h.head_length}};
             rx_begin_ += total;
+            turn_bytes_ += total;
             return dispatch(frame) ? step::parsed : step::failed;
         }
     }
     auto const decoded = wire::decode_frame({rx_ + rx_begin_, available}, limits);
     if (decoded.code == wire::error::none) {
         rx_begin_ += decoded.consumed;
+        turn_bytes_ += decoded.consumed;
         return dispatch(decoded.value) ? step::parsed : step::failed;
     }
     if (decoded.code == wire::error::need_more) return prepare_receive(available);
@@ -337,6 +353,38 @@ std::size_t connection::gather(net::const_buffer *const buffers, std::size_t con
     return count;
 }
 
+void connection::queue_stream(fragment_source &source) noexcept {
+    assert(!source.waiting && state_ != phase::closed);
+    source.waiting = true;
+    source.prev_source = sources_tail_;
+    source.next_source = nullptr;
+    if (sources_tail_ != nullptr) sources_tail_->next_source = &source;
+    else sources_head_ = &source;
+    sources_tail_ = &source;
+    if (writer_wake_.waiting()) writer_wake_.signal();
+}
+
+void connection::unqueue_stream(fragment_source &source) noexcept {
+    if (!source.waiting) return;
+    source.waiting = false;
+    if (source.prev_source != nullptr) source.prev_source->next_source = source.next_source;
+    else sources_head_ = source.next_source;
+    if (source.next_source != nullptr) source.next_source->prev_source = source.prev_source;
+    else sources_tail_ = source.prev_source;
+    source.prev_source = source.next_source = nullptr;
+}
+
+// One fragment per waiting source in turn, while the budget lasts.
+void connection::refill() noexcept {
+    while (sources_head_ != nullptr && tx_bytes_ < options.stream_send_budget) {
+        auto &source = *sources_head_;
+        unqueue_stream(source);
+        bool const more = source.next_fragment();
+        if (state_ == phase::closed) return; // The source may be gone.
+        if (more) queue_stream(source);
+    }
+}
+
 void connection::consume(std::size_t bytes) noexcept {
     tx_bytes_ -= bytes;
     while (chunk_count_ != 0) {
@@ -370,6 +418,7 @@ void connection::release_tx() noexcept {
 void connection::close() noexcept {
     if (state_ == phase::closed) return;
     state_ = phase::closed;
+    while (sources_head_ != nullptr) unqueue_stream(*sources_head_); // Before the role aborts its streams.
     shard.unschedule(handshake_timer_);
     if (link_) link_->close();
     writer_wake_.signal();

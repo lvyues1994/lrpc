@@ -114,5 +114,6 @@ cmake --build --preset fuzz
 
 ## 性能
 
-[基准用法](benchmarks/README.md) 以裸 net 固定长度回显为对照，覆盖同线程和跨进程回环 TCP、闭环与开放负载、逐请求延迟和分配诊断。
+[基准用法](benchmarks/README.md) 以裸 net 固定长度回显为对照，覆盖同线程和跨进程回环 TCP、闭环与开放负载、逐请求延迟和分配诊断，
+另测与批量流共用连接时的一元延迟。
 当前实测与零分配门槛见 [设计说明](docs/design.md#实测)。

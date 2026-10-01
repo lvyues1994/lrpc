@@ -109,6 +109,7 @@ struct server_stream_call final : stream_core, response_state {
         if (!ended) {
             ended = true;
             result = code;
+            abandon_write();
             drop_messages();
             wake_all();
         }
@@ -733,6 +734,7 @@ void session::complete(server_stream_call &call, status_code code) noexcept {
     --core->stats.active_calls;
     core->stats.request_bytes -= call.head_charge;
     call.ended = true; // Held messages are freed without returning credit.
+    call.abandon_write();
     call.conn = nullptr;
     delete &call;
     --active;

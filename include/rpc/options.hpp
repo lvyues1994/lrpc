@@ -27,6 +27,13 @@ struct connection_options {
     // writer drains below the low one: TCP pushes the pressure back to the peer.
     std::size_t tx_high_watermark = 8U << 20;
     std::size_t tx_low_watermark = 2U << 20;
+    // Stream messages leave in fragments of at most stream_fragment_bytes,
+    // framed only while fewer than stream_send_budget bytes wait for the
+    // socket. Streams take turns a fragment at a time, and other frames queue
+    // behind at most about one budget of stream data; the stream window still
+    // bounds what waits in kernel buffers. Both must be nonzero.
+    std::size_t stream_fragment_bytes = 16U << 10;
+    std::size_t stream_send_budget = 256U << 10;
     std::uint32_t frames_per_turn = 64;
     std::chrono::milliseconds handshake_timeout{5000};
     // Stream messages only; both ends must enable wire::message_compression

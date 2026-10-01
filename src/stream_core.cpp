@@ -17,8 +17,10 @@ std::uint32_t message_cost(std::size_t const size) noexcept {
 } // namespace
 
 stream_core::~stream_core() {
+    assert(!waiting);
     release_current();
     drop_messages();
+    release_packed();
 }
 
 void stream_core::open(connection &link, std::size_t const outbound_limit) noexcept {
@@ -131,87 +133,136 @@ bool stream_core::decompress() noexcept {
 bool stream_core::on_window(wire::frame_view const &frame) noexcept {
     if (!flow_controlled() || frame.header.aux > peer_window - send_credit) return false;
     send_credit += frame.header.aux;
-    if (send_credit >= writer_need) writer.wake();
+    // On failed the stream may be gone; the reader stops on the closed connection.
+    if (outgoing == out_credit && send_credit >= writer_need && start_message() == write_step::done) writer.wake();
     return true;
 }
 
-namespace {
+stream_core::write_step stream_core::begin_write(wire::bytes_view const message) noexcept {
+    out = message;
+    if (flow_controlled() && message_cost(message.size) > send_credit) {
+        writer_need = message_cost(message.size);
+        outgoing = out_credit;
+        return write_step::waiting;
+    }
+    return start_message();
+}
 
-// A compressed copy when compression is negotiated and pays off.
-struct compressed_copy {
-    slab &memory;
-    std::uint8_t *block = nullptr;
-    std::size_t capacity = 0;
-    wire::bytes_view bytes{};
-    std::uint8_t algorithm = 0;
-    ~compressed_copy() { memory.deallocate(block, capacity); }
-};
+// The whole credit is in hand: compress, take it, and frame what the turn allows.
+stream_core::write_step stream_core::start_message() noexcept {
+    auto const size = out.size;
+    writer_need = 0;
+    pack();
+    if (wire::encode_message_descriptor(
+            {static_cast<std::uint32_t>(out.size), static_cast<std::uint32_t>(size), out_algorithm},
+            {out_descriptor.data(), out_descriptor.size()}, conn->outgoing())
+            .code != wire::error::none) {
+        finish_write(status_code::resource_exhausted);
+        return write_step::done;
+    }
+    if (flow_controlled()) send_credit -= message_cost(size);
+    out_offset = 0;
+    out_first = true;
+    outgoing = out_framing;
+    return frame_message();
+}
 
-void compress(connection const &link, shard_state &shard, wire::bytes_view const message, compressed_copy &out) noexcept {
+stream_core::write_step stream_core::frame_message() noexcept {
+    while (conn->stream_room()) {
+        auto const step = emit_fragment();
+        if (step != write_step::waiting) return step;
+    }
+    conn->queue_stream(*this);
+    return write_step::waiting;
+}
+
+stream_core::write_step stream_core::emit_fragment() noexcept {
+    auto &link = *conn;
+    std::size_t const head = out_first ? out_descriptor.size() : 0;
+    auto const count = std::min({out.size - out_offset, std::size_t{link.peer().max_frame_size} - head,
+                                 link.options.stream_fragment_bytes});
+    bool const last = out_offset + count == out.size;
+    std::uint8_t *frame = nullptr;
+    try {
+        frame = link.reserve(wire::header_size + head + count);
+    } catch (std::bad_alloc const &) {
+        link.close(); // A message cut short cannot be resumed on the wire.
+        return write_step::failed;
+    }
+    wire::frame_header header{};
+    header.length = static_cast<std::uint32_t>(head + count);
+    header.stream_id = id;
+    header.type = wire::frame_type::message;
+    header.flags = static_cast<std::uint8_t>((last ? 0 : wire::more) |
+                                             (out_first && out_algorithm != 0 ? wire::compressed : 0));
+    header.head_length = static_cast<std::uint16_t>(head);
+    if (wire::encode_header(header, {frame, wire::header_size}, link.outgoing()).code != wire::error::none) {
+        link.close();
+        return write_step::failed;
+    }
+    if (head != 0) std::memcpy(frame + wire::header_size, out_descriptor.data(), head);
+    if (count != 0) std::memcpy(frame + wire::header_size + head, out.data + out_offset, count);
+    link.commit(wire::header_size + head + count);
+    out_offset += count;
+    out_first = false;
+    if (!last) return write_step::waiting;
+    ++sent;
+    finish_write(status_code::ok);
+    return write_step::done;
+}
+
+bool stream_core::next_fragment() noexcept {
+    auto const step = emit_fragment();
+    if (step == write_step::done) writer.wake();
+    return step == write_step::waiting;
+}
+
+void stream_core::abandon_write() noexcept {
+    if (outgoing == out_idle) return;
+    assert(!waiting || conn != nullptr);
+    if (waiting) conn->unqueue_stream(*this);
+    finish_write(result == status_code::ok ? status_code::failed_precondition : result);
+}
+
+// Replaces the bytes to send with a compressed copy when compression is
+// negotiated and pays off.
+void stream_core::pack() noexcept {
+    out_algorithm = 0;
+    auto const &link = *conn;
     auto const algorithm = link.options.preferred_compression;
-    if (algorithm == 0 || message.size < link.options.compression_threshold ||
+    if (algorithm == 0 || out.size < link.options.compression_threshold ||
         (link.features() & wire::message_compression) == 0 || (link.peer().compression & (1U << (algorithm - 1U))) == 0)
         return;
     auto *const codec = shard.compressor(algorithm);
-    auto const bound = codec != nullptr ? codec->bound(message.size) : 0;
+    auto const bound = codec != nullptr ? codec->bound(out.size) : 0;
     if (bound == 0) return;
     try {
-        out.block = shard.memory.allocate(bound);
-        out.capacity = slab::block_size(bound);
+        packed = shard.memory.allocate(bound);
+        packed_capacity = slab::block_size(bound);
     } catch (std::bad_alloc const &) {
         return; // Send it uncompressed.
     }
-    auto const result = codec->compress(message, {out.block, bound});
-    if (result.code != wire::error::none || result.written >= message.size) return;
-    out.bytes = {out.block, result.written};
-    out.algorithm = algorithm;
+    auto const result = codec->compress(out, {packed, bound});
+    if (result.code != wire::error::none || result.written >= out.size) {
+        release_packed();
+        return;
+    }
+    out = {packed, result.written};
+    out_algorithm = algorithm;
 }
 
-} // namespace
+void stream_core::finish_write(status_code const code) noexcept {
+    release_packed();
+    out = {};
+    outgoing = out_idle;
+    writer_need = 0;
+    out_result = code;
+}
 
-status_code stream_core::send(wire::bytes_view const message) noexcept {
-    auto &link = *conn;
-    compressed_copy packed{shard.memory};
-    compress(link, shard, message, packed);
-    auto const payload = packed.algorithm != 0 ? packed.bytes : message;
-    std::array<std::uint8_t, wire::message_descriptor_size> descriptor{};
-    auto const size = static_cast<std::uint32_t>(message.size);
-    if (wire::encode_message_descriptor({static_cast<std::uint32_t>(payload.size), size, packed.algorithm},
-                                        {descriptor.data(), descriptor.size()}, link.outgoing())
-            .code != wire::error::none)
-        return status_code::resource_exhausted;
-    if (flow_controlled()) send_credit -= message_cost(size);
-    std::size_t const max_frame = link.peer().max_frame_size;
-    std::size_t offset = 0;
-    bool first = true;
-    try {
-        do {
-            std::size_t const head = first ? descriptor.size() : 0;
-            auto const count = std::min(payload.size - offset, max_frame - head);
-            auto *const frame = link.reserve(wire::header_size + head + count);
-            wire::frame_header header{};
-            header.length = static_cast<std::uint32_t>(head + count);
-            header.stream_id = id;
-            header.type = wire::frame_type::message;
-            header.flags = static_cast<std::uint8_t>((offset + count < payload.size ? wire::more : 0) |
-                                                     (first && packed.algorithm != 0 ? wire::compressed : 0));
-            header.head_length = static_cast<std::uint16_t>(head);
-            if (wire::encode_header(header, {frame, wire::header_size}, link.outgoing()).code != wire::error::none) {
-                link.close();
-                return status_code::internal;
-            }
-            if (head != 0) std::memcpy(frame + wire::header_size, descriptor.data(), head);
-            if (count != 0) std::memcpy(frame + wire::header_size + head, payload.data + offset, count);
-            link.commit(wire::header_size + head + count);
-            offset += count;
-            first = false;
-        } while (offset < payload.size);
-    } catch (std::bad_alloc const &) {
-        link.close(); // A message cut short cannot be resumed on the wire.
-        return status_code::unavailable;
-    }
-    ++sent;
-    return status_code::ok;
+void stream_core::release_packed() noexcept {
+    shard.memory.deallocate(packed, packed_capacity);
+    packed = nullptr;
+    packed_capacity = 0;
 }
 
 status_code stream_core::send_half() noexcept {
@@ -310,32 +361,25 @@ bool write_operation::await_ready() noexcept {
     if (core_ == nullptr) return (result_ = status_code::failed_precondition), true;
     auto &s = *core_;
     if (s.ended) return (result_ = s.result == status_code::ok ? status_code::failed_precondition : s.result), true;
-    if (s.local_half || (!half_ && s.sends_one() && s.sent != 0)) return (result_ = status_code::failed_precondition), true;
+    if (s.writing() || s.local_half || (!half_ && s.sends_one() && s.sent != 0))
+        return (result_ = status_code::failed_precondition), true;
     if (half_) return (result_ = s.send_half()), true;
     auto const cost = std::max<std::uint32_t>(1, static_cast<std::uint32_t>(message_.size));
     if (message_.size > s.max_outbound || (s.flow_controlled() && cost > s.peer_window))
         return (result_ = status_code::resource_exhausted), true;
-    if (!s.flow_controlled() || cost <= s.send_credit) return (result_ = s.send(message_)), true;
-    s.writer_need = cost;
+    switch (s.begin_write(message_)) {
+    case detail::stream_core::write_step::done: return (result_ = s.out_result), true;
+    case detail::stream_core::write_step::failed: return (result_ = status_code::unavailable), true;
+    case detail::stream_core::write_step::waiting: break;
+    }
     return done_ = false;
 }
 
 net::coroutine_handle<> write_operation::await_suspend(net::coroutine_handle<> handle, net::io_env const *env) noexcept {
-    if (core_->writer.armed) {
-        result_ = status_code::failed_precondition;
-        done_ = true;
-        return handle;
-    }
     core_->writer.arm(handle, env);
     return net::noop_coroutine();
 }
 
-status_code write_operation::await_resume() noexcept {
-    if (done_) return result_;
-    auto &s = *core_;
-    s.writer_need = 0;
-    if (s.ended) return s.result == status_code::ok ? status_code::failed_precondition : s.result;
-    return s.send(message_); // Woken with enough credit.
-}
+status_code write_operation::await_resume() noexcept { return done_ ? result_ : core_->out_result; }
 
 } // namespace rpc

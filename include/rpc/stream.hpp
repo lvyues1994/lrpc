@@ -45,8 +45,9 @@ private:
     bool done_ = false;
 };
 
-// Completes once the message is queued for sending, waiting for flow-control
-// credit if needed; the bytes are copied by then.
+// Completes once the whole message is framed for sending, after waiting for
+// flow-control credit and for the stream's turns on the connection; the
+// bytes are borrowed until then.
 class write_operation {
 public:
     bool await_ready() noexcept;

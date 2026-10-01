@@ -44,6 +44,7 @@ void client_stream_core::end(status_code const code, bool const not_executed) no
     ended = true;
     result = code;
     unexecuted = not_executed;
+    abandon_write();
     if (owner != nullptr) {
         owner->streams.erase(id);
         owner->settle();

@@ -4,6 +4,7 @@
 
 #include <rpc/stream.hpp>
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <vector>
@@ -40,7 +41,10 @@ struct inbound_message {
 // on the first, reassembly, per-message window accounting with credit
 // returned once the reader lets go of a message, and half-close. How a
 // stream ends belongs to the role.
-struct stream_core : stream_state {
+//
+// A write borrows the caller's bytes until the message is framed: it waits
+// for the message's whole credit, then for turns on the connection.
+struct stream_core : stream_state, fragment_source {
     stream_core(shard_state &state, method_kind stream_kind, bool client) noexcept
         : shard(state), kind(stream_kind), client_side(client) {}
     virtual ~stream_core();
@@ -64,7 +68,14 @@ struct stream_core : stream_state {
     bool on_message(wire::frame_view const &frame) noexcept;
     bool decompress() noexcept;
     bool on_window(wire::frame_view const &frame) noexcept;
-    status_code send(wire::bytes_view message) noexcept;
+
+    // done: out_result holds the outcome. failed: this closed the
+    // connection, and the stream may already be gone.
+    enum class write_step : std::uint8_t { done, waiting, failed };
+    bool writing() const noexcept { return outgoing != out_idle; }
+    write_step begin_write(wire::bytes_view message) noexcept;
+    bool next_fragment() noexcept override;
+    void abandon_write() noexcept; // The stream ended; before it leaves its connection.
     status_code send_half() noexcept;
     bool take(stream_read &out) noexcept; // False: nothing to report yet.
     void release_current() noexcept;
@@ -104,6 +115,24 @@ struct stream_core : stream_state {
     stream_waiter reader;
     stream_waiter writer;
     stream_waiter finisher;
+
+    write_step start_message() noexcept;
+    write_step frame_message() noexcept;
+    write_step emit_fragment() noexcept;
+    void pack() noexcept;
+    void finish_write(status_code code) noexcept;
+    void release_packed() noexcept;
+
+    enum : std::uint8_t { out_idle, out_credit, out_framing };
+    std::uint8_t outgoing = out_idle;
+    std::uint8_t out_algorithm = 0;
+    bool out_first = false;
+    status_code out_result = status_code::ok;
+    wire::bytes_view out{}; // The caller's bytes, or the compressed copy.
+    std::size_t out_offset = 0;
+    std::uint8_t *packed = nullptr;
+    std::size_t packed_capacity = 0;
+    std::array<std::uint8_t, wire::message_descriptor_size> out_descriptor{};
 };
 
 struct stream_access {
