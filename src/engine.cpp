@@ -62,8 +62,9 @@ auto reader_loop(std::shared_ptr<void> keep, connection *c)
         }
         outcome = connection_io::parse(*c);
         if (outcome == parse_step::parsed) {
-            // Reads may complete inline, so a receive buffer's worth of frames
-            // also ends a turn: bulk data must not hold back the writer.
+            // Reads may complete inline, so a receive buffer's worth of stream
+            // messages also ends a turn: bulk data must not hold back the
+            // writer. Calls keep the frame count, which batches their replies.
             if (++turn >= c->options.frames_per_turn || connection_io::turn_spent(*c)) {
                 turn = 0;
                 connection_io::new_turn(*c);
@@ -196,14 +197,13 @@ parse_step connection::parse() noexcept {
             auto *const head = rx_ + rx_begin_ + wire::header_size;
             wire::frame_view const frame{h, {head, h.head_length}, {head + h.head_length, h.length - h.head_length}};
             rx_begin_ += total;
-            turn_bytes_ += total;
             return dispatch(frame) ? step::parsed : step::failed;
         }
     }
     auto const decoded = wire::decode_frame({rx_ + rx_begin_, available}, limits);
     if (decoded.code == wire::error::none) {
         rx_begin_ += decoded.consumed;
-        turn_bytes_ += decoded.consumed;
+        if (decoded.value.header.type == wire::frame_type::message) turn_bytes_ += decoded.consumed;
         return dispatch(decoded.value) ? step::parsed : step::failed;
     }
     if (decoded.code == wire::error::need_more) return prepare_receive(available);

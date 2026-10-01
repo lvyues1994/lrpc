@@ -66,6 +66,7 @@ using rpc::wire::mutable_bytes_view;
 
 net::backend_kind selected_backend = net::default_backend_t::kind;
 constexpr std::size_t payload = 64;
+constexpr std::size_t large_payload = 4096;
 constexpr unsigned workers = 64;
 std::atomic<std::uint64_t> server_clock_reads{0};
 
@@ -145,6 +146,7 @@ struct server_side {
         context.set_frame_allocator(&context.recycling_frame_allocator());
         shard.reset(new rpc::shard(context));
         std::vector<rpc::method_binding> methods{{"gate/Echo", &handler, payload},
+                                                 {"gate/Echo4k", &handler, large_payload},
                                                  {"gate/Chat", nullptr, payload, 0, rpc::method_kind::bidirectional, &chat}};
         methods.push_back(rpc::bind_method(increment, typed, &typed_service::Increment));
         server.reset(new rpc::server(*shard, std::move(methods)));
@@ -226,6 +228,7 @@ struct client_side {
         shard.reset(new rpc::shard(context));
         client.reset(new rpc::client(*shard));
         method = client->bind("gate/Echo");
+        large_method = client->bind("gate/Echo4k");
         chat = client->bind("gate/Chat");
         typed_call.reset(new rpc::bound_method<number, number>(*client, increment));
     }
@@ -239,11 +242,14 @@ struct client_side {
     std::unique_ptr<rpc::shard> shard;
     std::unique_ptr<rpc::client> client;
     rpc::method_ref method;
+    rpc::method_ref large_method;
     rpc::method_ref chat;
     std::unique_ptr<rpc::bound_method<number, number>> typed_call;
     std::atomic<std::uint64_t> writes{0};
     std::array<std::array<std::uint8_t, payload>, workers> requests{};
     std::array<std::array<std::uint8_t, payload>, workers> replies{};
+    std::vector<std::array<std::uint8_t, large_payload>> large_requests{workers};
+    std::vector<std::array<std::uint8_t, large_payload>> large_replies{workers};
     latch done;
 };
 
@@ -298,6 +304,18 @@ auto worker(client_side &self, unsigned index, unsigned count)
         CO2_AWAIT_SET(result, self.client->call(self.method, {self.requests[index].data(), payload},
                                                 {self.replies[index].data(), payload}));
         CHECK(result.code == rpc::status_code::ok && self.replies[index] == self.requests[index]);
+    }
+    self.done.count_down();
+    CO2_RETURN();
+}
+CO2_END
+
+auto large_worker(client_side &self, unsigned index, unsigned count)
+    CO2_BEG(net::task<>, (self, index, count), rpc::call_result result; unsigned i = 0;) {
+    for (i = 0; i < count; ++i) {
+        CO2_AWAIT_SET(result, self.client->call(self.large_method, {self.large_requests[index].data(), large_payload},
+                                                {self.large_replies[index].data(), large_payload}));
+        CHECK(result.code == rpc::status_code::ok && self.large_replies[index] == self.large_requests[index]);
     }
     self.done.count_down();
     CO2_RETURN();
@@ -381,6 +399,23 @@ auto drive(client_side &self)
     CHECK(after.client_clock == before.client_clock);
     CHECK(double(after.client_writes - before.client_writes) <= 0.1 * workers * 200);
     CHECK(double(after.server_writes - before.server_writes) <= 0.1 * workers * 200);
+
+    // 4 KiB calls overflow a receive buffer per turn; replies must still leave in batches.
+    for (i = 0; i < workers; ++i) self.large_requests[i].fill(static_cast<std::uint8_t>(i));
+    for (round = 0; round < 2; ++round) {
+        self.done.remaining = workers;
+        for (i = 0; i < workers; ++i) net::run_async(self.context.get_executor())(large_worker(self, i, 200));
+        before = self.snapshot();
+        CO2_AWAIT(self.done.wait());
+        after = self.snapshot();
+    }
+    report("64 in flight, 4 KiB", before, after, workers * 200.0);
+    CHECK(after.client_allocations == before.client_allocations);
+    CHECK(after.server_allocations == before.server_allocations);
+    // Readiness backends read the whole burst inline; io_uring completes each
+    // receive buffer's read on its own, and the writer runs between them.
+    CHECK(double(after.server_writes - before.server_writes) <=
+          (selected_backend == net::backend_kind::io_uring ? 0.1 : 0.05) * workers * 200);
     CO2_RETURN();
 }
 CO2_END

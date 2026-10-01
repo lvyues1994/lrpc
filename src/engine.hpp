@@ -130,7 +130,7 @@ private:
     std::size_t rx_capacity_ = 0;
     std::size_t rx_begin_ = 0;
     std::size_t rx_end_ = 0;
-    std::size_t turn_bytes_ = 0; // Parsed since the reader last yielded.
+    std::size_t turn_bytes_ = 0; // MESSAGE bytes parsed since the reader last yielded.
 
     std::vector<chunk> chunks_; // Ring; the size is a power of two.
     std::size_t chunk_head_ = 0;
