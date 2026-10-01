@@ -124,7 +124,7 @@ struct server_stream_call final : stream_core, response_state {
     server_context context{};
     server_stream handle{};
     response_writer writer{};
-    net::stop_source stop;
+    net::stop_source stop{co2::nostopstate}; // From server_core::take_stop.
     net::io_env env{};
     net::task<status_code> task{};
     net::detail::completion_frame done;
@@ -155,6 +155,8 @@ struct server_core : std::enable_shared_from_this<server_core> {
     void close() noexcept;
     server_call &acquire_call();
     void release_call(server_call &call) noexcept;
+    net::stop_source take_stop(); // Throws std::bad_alloc.
+    void keep_stop(net::stop_source &stop) noexcept;
     void link(session &value) noexcept;
     void unlink(session &value) noexcept;
 
@@ -166,6 +168,9 @@ struct server_core : std::enable_shared_from_this<server_core> {
     session *sessions = nullptr;
     server_stats stats{};
     server_call *free_calls = nullptr;
+    // As a unary call keeps its own, a finished stream leaves an unrequested
+    // stop state for the next one.
+    std::vector<net::stop_source> spare_stops;
     bool draining = false;
     bool closed = false;
 };
@@ -414,6 +419,21 @@ void server_core::release_call(server_call &call) noexcept {
     free_calls = &call;
 }
 
+net::stop_source server_core::take_stop() {
+    if (spare_stops.empty()) return net::stop_source{};
+    auto stop = std::move(spare_stops.back());
+    spare_stops.pop_back();
+    return stop;
+}
+
+void server_core::keep_stop(net::stop_source &stop) noexcept {
+    if (!stop.stop_possible() || stop.stop_requested()) return;
+    try {
+        spare_stops.push_back(std::move(stop));
+    } catch (std::bad_alloc const &) {
+    }
+}
+
 void server_core::link(session &value) noexcept {
     value.next = sessions;
     if (sessions != nullptr) sessions->prev = &value;
@@ -602,15 +622,17 @@ void session::start_stream(method_entry const &entry, wire::frame_view const &fr
                            clock::time_point const deadline) noexcept {
     auto const id = frame.header.stream_id;
     if (conn.options.receive.initial_stream_window == 0) return reject(id, status_code::unimplemented);
+    auto &memory = core->shard.memory;
     server_stream_call *call = nullptr;
     try {
-        call = new server_stream_call(*core, *this, entry);
+        call = make_in<server_stream_call>(memory, *core, *this, entry);
+        call->stop = core->take_stop();
         if (frame.head.size != 0) {
-            call->head_block = core->shard.memory.allocate(frame.head.size);
+            call->head_block = memory.allocate(frame.head.size);
             call->head_capacity = slab::block_size(frame.head.size);
         }
     } catch (std::bad_alloc const &) {
-        delete call;
+        destroy_in(memory, call);
         return reject(id, status_code::resource_exhausted);
     }
     if (frame.head.size != 0) std::memcpy(call->head_block, frame.head.data, frame.head.size);
@@ -736,7 +758,8 @@ void session::complete(server_stream_call &call, status_code code) noexcept {
     call.ended = true; // Held messages are freed without returning credit.
     call.abandon_write();
     call.conn = nullptr;
-    delete &call;
+    core->keep_stop(call.stop);
+    destroy_in(core->shard.memory, &call);
     --active;
     if (goaway_sent && active == 0) conn.close_when_flushed();
     release_if_done(); // May destroy this session.

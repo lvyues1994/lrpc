@@ -20,6 +20,7 @@ stream_core::~stream_core() {
     assert(!waiting);
     release_current();
     drop_messages();
+    release_inbox();
     release_packed();
 }
 
@@ -33,20 +34,34 @@ void stream_core::open(connection &link, std::size_t const outbound_limit) noexc
 }
 
 bool stream_core::push(inbound_message const &message) noexcept {
-    if (inbox_count == inbox.size()) {
+    if (inbox_count == inbox_capacity) {
         if (inbox_count >= max_buffered) return false;
+        auto const capacity = std::min(std::max<std::size_t>(inbox_capacity * 2, 8), max_buffered);
+        std::uint8_t *grown = nullptr;
         try {
-            std::vector<inbound_message> grown(std::min(std::max<std::size_t>(inbox.size() * 2, 8), max_buffered));
-            for (std::size_t i = 0; i != inbox_count; ++i) grown[i] = inbox[(inbox_head + i) % inbox.size()];
-            inbox.swap(grown);
-            inbox_head = 0;
+            grown = shard.memory.allocate(capacity * sizeof(inbound_message));
         } catch (std::bad_alloc const &) {
             return false;
         }
+        // The ring unwraps into the new block, oldest first.
+        auto const front = std::min(inbox_count, inbox_capacity - inbox_head);
+        if (front != 0) std::memcpy(grown, inbox + inbox_head, front * sizeof(inbound_message));
+        if (front != inbox_count)
+            std::memcpy(grown + front * sizeof(inbound_message), inbox, (inbox_count - front) * sizeof(inbound_message));
+        release_inbox();
+        inbox = reinterpret_cast<inbound_message *>(grown);
+        inbox_capacity = capacity;
+        inbox_head = 0;
     }
-    inbox[(inbox_head + inbox_count) % inbox.size()] = message;
+    std::memcpy(static_cast<void *>(inbox + (inbox_head + inbox_count) % inbox_capacity), &message, sizeof(message));
     ++inbox_count;
     return true;
+}
+
+void stream_core::release_inbox() noexcept {
+    shard.memory.deallocate(reinterpret_cast<std::uint8_t *>(inbox), inbox_capacity * sizeof(inbound_message));
+    inbox = nullptr;
+    inbox_capacity = 0;
 }
 
 bool stream_core::on_message(wire::frame_view const &frame) noexcept {
@@ -291,7 +306,7 @@ bool stream_core::take(stream_read &out) noexcept {
     if (inbox_count != 0) {
         current = inbox[inbox_head];
         inbox[inbox_head] = {};
-        inbox_head = (inbox_head + 1) % inbox.size();
+        inbox_head = (inbox_head + 1) % inbox_capacity;
         --inbox_count;
         out = {status_code::ok, false, {current.block, current.size}};
         return true;
@@ -322,7 +337,7 @@ void stream_core::drop_messages() noexcept {
         auto &message = inbox[inbox_head];
         shard.memory.deallocate(message.block, message.capacity);
         message = {};
-        inbox_head = (inbox_head + 1) % inbox.size();
+        inbox_head = (inbox_head + 1) % inbox_capacity;
     }
     shard.memory.deallocate(assembly.block, assembly.capacity);
     assembly = {};

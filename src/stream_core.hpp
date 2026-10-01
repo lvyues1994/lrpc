@@ -7,7 +7,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
-#include <vector>
+#include <type_traits>
 
 namespace rpc {
 namespace detail {
@@ -36,6 +36,7 @@ struct inbound_message {
     std::uint32_t cost = 0; // Flow-control credit it holds.
     bool held = false;
 };
+static_assert(std::is_trivially_copyable<inbound_message>::value, "the inbox copies its ring bytewise");
 
 // Message flow shared by both ends of a stream: fragments with a descriptor
 // on the first, reassembly, per-message window accounting with credit
@@ -65,6 +66,7 @@ struct stream_core : stream_state, fragment_source {
     void open(connection &link, std::size_t outbound_limit) noexcept;
 
     bool push(inbound_message const &message) noexcept; // False when full.
+    void release_inbox() noexcept;
     bool on_message(wire::frame_view const &frame) noexcept;
     bool decompress() noexcept;
     bool on_window(wire::frame_view const &frame) noexcept;
@@ -108,7 +110,8 @@ struct stream_core : stream_state, fragment_source {
     std::size_t assembly_decoded = 0; // Declared decoded size.
     std::uint8_t assembly_algorithm = 0;
     bool assembling = false;
-    std::vector<inbound_message> inbox; // Ring; grows by doubling up to max_buffered.
+    inbound_message *inbox = nullptr; // Ring in a slab block; grows by doubling up to max_buffered.
+    std::size_t inbox_capacity = 0;
     std::size_t inbox_head = 0;
     std::size_t inbox_count = 0;
     inbound_message current{}; // Lent to the reader until its next read.

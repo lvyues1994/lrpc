@@ -27,7 +27,7 @@ struct client_stream_core final : stream_core {
     void end(status_code code, bool not_executed) noexcept;
     bool on_end(wire::frame_view const &frame) noexcept;
     void release() noexcept {
-        if (--refs == 0) delete this;
+        if (--refs == 0) destroy_in(shard.memory, this);
     }
 
     client_core *owner;
@@ -143,13 +143,14 @@ open_result open_stream(client_core *core, call_router *router, std::uint32_t co
     client_stream_core *stream = nullptr;
     stop_hook *hook = nullptr;
     std::uint8_t *frame = nullptr;
+    auto &memory = core->shard.memory;
     try {
-        stream = new client_stream_core(*core, kind);
+        stream = make_in<client_stream_core>(memory, *core, kind);
         if (env.stop_token.stop_possible()) hook = core->shard.acquire_hook();
         frame = conn.reserve(wire::header_size + plan.payload);
     } catch (std::bad_alloc const &) {
         if (hook != nullptr) core->shard.release_hook(*hook);
-        delete stream;
+        destroy_in(memory, stream);
         return {status_code::resource_exhausted, {}};
     }
     auto const id = core->next_id;
@@ -157,7 +158,7 @@ open_result open_stream(client_core *core, call_router *router, std::uint32_t co
     auto const written = write_request(*core, plan, frame, id, {}, false, length);
     if (written != status_code::ok) {
         if (hook != nullptr) core->shard.release_hook(*hook);
-        delete stream;
+        destroy_in(memory, stream);
         return {written, {}};
     }
     stream->id = id;

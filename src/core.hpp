@@ -130,6 +130,25 @@ private:
     std::size_t limit_;
 };
 
+// An object in a slab block, so steady-state churn reuses cached blocks.
+// Destroy it as its own (final) type.
+template <class T, class... Args> T *make_in(slab &memory, Args &&...args) {
+    static_assert(alignof(T) <= alignof(std::max_align_t), "slab blocks are max_align_t aligned");
+    auto *const block = memory.allocate(sizeof(T));
+    try {
+        return ::new (static_cast<void *>(block)) T(std::forward<Args>(args)...);
+    } catch (...) {
+        memory.deallocate(block, sizeof(T));
+        throw;
+    }
+}
+
+template <class T> void destroy_in(slab &memory, T *const object) noexcept {
+    if (object == nullptr) return;
+    object->~T();
+    memory.deallocate(reinterpret_cast<std::uint8_t *>(object), sizeof(T));
+}
+
 // Fixed capacity, Robin Hood open addressing at load factor <= 1/2, with
 // backward-shift deletion. Stream IDs are monotonic, so the low bits are a
 // good hash and nearly every entry sits in its home slot: in-flight streams

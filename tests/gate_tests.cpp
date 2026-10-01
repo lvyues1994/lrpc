@@ -1,7 +1,7 @@
 // Cost gates for the hot path, each measured per call in steady state:
 // heap allocations on the client and server threads, for bytes and typed
-// calls; clock reads with and without a deadline; and socket writes with 64
-// calls in flight.
+// calls and for whole streams; clock reads with and without a deadline; and
+// socket writes with 64 calls in flight.
 #include "backend.hpp"
 #include "check.hpp"
 
@@ -102,6 +102,24 @@ struct echo_handler final : rpc::method_handler {
     }
 };
 
+auto chat_body(rpc::server_stream &stream)
+    CO2_BEG(net::task<rpc::status_code>, (stream), rpc::stream_read read; rpc::status_code wrote;) {
+    for (;;) {
+        CO2_AWAIT_SET(read, stream.read());
+        if (read.code != rpc::status_code::ok) CO2_RETURN(read.code);
+        if (read.ended) CO2_RETURN(rpc::status_code::ok);
+        CO2_AWAIT_SET(wrote, stream.write(read.message));
+        if (wrote != rpc::status_code::ok) CO2_RETURN(wrote);
+    }
+}
+CO2_END
+
+struct chat_handler final : rpc::stream_method_handler {
+    net::task<rpc::status_code> invoke(rpc::server_context &, rpc::server_stream &stream) override {
+        return chat_body(stream);
+    }
+};
+
 rpc::method<number, number> const increment{"gate/Increment"};
 
 auto increment_body(number const &request, number &response)
@@ -126,7 +144,8 @@ struct server_side {
     server_side() {
         context.set_frame_allocator(&context.recycling_frame_allocator());
         shard.reset(new rpc::shard(context));
-        std::vector<rpc::method_binding> methods{{"gate/Echo", &handler, payload}};
+        std::vector<rpc::method_binding> methods{{"gate/Echo", &handler, payload},
+                                                 {"gate/Chat", nullptr, payload, 0, rpc::method_kind::bidirectional, &chat}};
         methods.push_back(rpc::bind_method(increment, typed, &typed_service::Increment));
         server.reset(new rpc::server(*shard, std::move(methods)));
         endpoint = acceptor.local_endpoint(error);
@@ -147,6 +166,7 @@ struct server_side {
     net::io_context context{selected_backend, net::single_thread_hint};
     std::unique_ptr<rpc::shard> shard;
     echo_handler handler;
+    chat_handler chat;
     typed_service typed;
     std::unique_ptr<rpc::server> server;
     net::tcp_acceptor acceptor{context, {net::ip::address_v4::loopback(), 0}};
@@ -206,6 +226,7 @@ struct client_side {
         shard.reset(new rpc::shard(context));
         client.reset(new rpc::client(*shard));
         method = client->bind("gate/Echo");
+        chat = client->bind("gate/Chat");
         typed_call.reset(new rpc::bound_method<number, number>(*client, increment));
     }
     counters snapshot() const {
@@ -218,6 +239,7 @@ struct client_side {
     std::unique_ptr<rpc::shard> shard;
     std::unique_ptr<rpc::client> client;
     rpc::method_ref method;
+    rpc::method_ref chat;
     std::unique_ptr<rpc::bound_method<number, number>> typed_call;
     std::atomic<std::uint64_t> writes{0};
     std::array<std::array<std::uint8_t, payload>, workers> requests{};
@@ -242,6 +264,29 @@ auto typed_sequential(client_side &self, unsigned count)
         request.value = i;
         CO2_AWAIT_SET(result, (*self.typed_call)(request, response));
         CHECK(result.code == rpc::status_code::ok && response.value == i + 1U);
+    }
+    CO2_RETURN();
+}
+CO2_END
+
+// Whole streams one after another: open, one message each way, half-close, finish.
+auto streams(client_side &self, unsigned count)
+    CO2_BEG(net::task<>, (self, count), rpc::open_result opened; rpc::status_code wrote; rpc::stream_read read;
+            rpc::call_result result; unsigned i = 0;) {
+    for (i = 0; i < count; ++i) {
+        CO2_AWAIT_SET(opened, self.client->open(self.chat, rpc::method_kind::bidirectional));
+        CHECK(opened.code == rpc::status_code::ok);
+        CO2_AWAIT_SET(wrote, opened.stream.write({self.requests[0].data(), payload}));
+        CHECK(wrote == rpc::status_code::ok);
+        CO2_AWAIT_SET(read, opened.stream.read());
+        CHECK(read.code == rpc::status_code::ok && !read.ended && read.message.size == payload);
+        CO2_AWAIT_SET(wrote, opened.stream.writes_done());
+        CHECK(wrote == rpc::status_code::ok);
+        CO2_AWAIT_SET(read, opened.stream.read());
+        CHECK(read.code == rpc::status_code::ok && read.ended);
+        CO2_AWAIT_SET(result, opened.stream.finish());
+        CHECK(result.code == rpc::status_code::ok);
+        opened.stream = {};
     }
     CO2_RETURN();
 }
@@ -285,6 +330,16 @@ auto drive(client_side &self)
     CO2_AWAIT(sequential(self, 2000, nullptr));
     CO2_AWAIT(sequential(self, 2000, &deadline));
     CO2_AWAIT(typed_sequential(self, 2000));
+    CO2_AWAIT(streams(self, 2000));
+
+    before = self.snapshot();
+    CO2_AWAIT(streams(self, 5000));
+    after = self.snapshot();
+    report("streams", before, after, 5000);
+    CHECK(after.client_allocations == before.client_allocations);
+    CHECK(after.server_allocations == before.server_allocations);
+    CHECK(after.client_clock == before.client_clock);
+    CHECK(after.server_clock == before.server_clock);
 
     before = self.snapshot();
     CO2_AWAIT(typed_sequential(self, 5000));
